@@ -1,6 +1,9 @@
 <script setup lang="ts">
 import { ref, onMounted, nextTick } from "vue";
 import { invoke, Channel } from "@tauri-apps/api/core";
+import { marked } from "marked";
+import hljs from "highlight.js";
+import DOMPurify from "dompurify";
 
 interface ChatMessage {
   role: "user" | "assistant" | "system";
@@ -23,6 +26,83 @@ const stoppedByUserIdx = ref<number | null>(null);
 const currentAssistantIdx = ref<number | null>(null);
 const awaitingFirstToken = ref(false);
 
+async function copyToClipboard(text: string) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return;
+  } catch {
+    try {
+      const { writeText } = await import("@tauri-apps/plugin-clipboard-manager");
+      await writeText(text);
+    } catch (e) {
+      console.error("Échec copie presse-papiers:", e);
+    }
+  }
+}
+
+function renderMarkdown(content: string): string {
+  const html = marked.parse(content, { breaks: true, gfm: true }) as string;
+  const div = document.createElement("div");
+  div.innerHTML = DOMPurify.sanitize(html);
+
+  div.querySelectorAll("pre > code").forEach((block) => {
+    const pre = block.parentElement as HTMLElement;
+
+    const match = /language-([\w+-]+)/.exec(block.className);
+    const language = match?.[1] ?? "";
+
+    // Coloration seulement si la langue est connue (sinon on garde le texte brut)
+    if (language && hljs.getLanguage(language)) {
+      block.innerHTML = hljs.highlight(block.textContent ?? "", {
+        language,
+        ignoreIllegals: true,
+      }).value;
+    }
+    block.classList.add("hljs");
+
+    const wrapper = document.createElement("div");
+    wrapper.className = "code-wrapper";
+
+    const header = document.createElement("div");
+    header.className = "code-header";
+
+    const langLabel = document.createElement("span");
+    langLabel.className = "code-lang";
+    langLabel.textContent = language
+      ? language.charAt(0).toUpperCase() + language.slice(1)
+      : "Texte";
+
+    const btn = document.createElement("button");
+    btn.className = "copy-btn";
+    btn.type = "button";
+    btn.textContent = "Copier";
+
+    header.append(langLabel, btn);
+
+    // D'abord remplacer le <pre> par le wrapper, ensuite y ranger l'en-tête et le <pre>
+    pre.replaceWith(wrapper);
+    wrapper.append(header, pre);
+  });
+
+  return div.innerHTML;
+}
+
+function onMessageClick(evt: MouseEvent) {
+  const btn = (evt.target as HTMLElement).closest(".copy-btn") as HTMLElement | null;
+  if (!btn) return;
+  const wrapper = btn.closest(".code-wrapper") as HTMLElement | null;
+  if (!wrapper) return;
+  const pre = wrapper.querySelector("pre");
+  if (!pre) return;
+  const code = pre.querySelector("code");
+  const text = code ? code.textContent ?? "" : pre.textContent ?? "";
+  copyToClipboard(text);
+  btn.textContent = "Copié ✓";
+  setTimeout(() => {
+    btn.textContent = "Copier";
+  }, 2000);
+}
+
 onMounted(async () => {
   try {
     const status = await invoke<OllamaStatus>("get_ollama_status");
@@ -32,11 +112,6 @@ onMounted(async () => {
     error.value = String(e);
   }
 });
-
-async function scrollDown() {
-  await nextTick();
-  list.value?.scrollTo({ top: list.value.scrollHeight });
-}
 
 async function send() {
   const text = input.value.trim();
@@ -55,7 +130,9 @@ async function send() {
   onToken.onmessage = (token) => {
     if (awaitingFirstToken.value) awaitingFirstToken.value = false;
     messages.value[idx].content += token;
-    scrollDown();
+    nextTick(() => {
+      list.value?.scrollTo({ top: list.value.scrollHeight });
+    });
   };
 
   busy.value = true;
@@ -105,10 +182,11 @@ async function stop() {
       </button>
     </header>
 
-    <div ref="list" class="messages">
+    <div ref="list" class="messages" @click="onMessageClick">
       <p v-if="messages.length === 0" class="hint">Pose une question à ton modèle local.</p>
       <div v-for="(m, i) in messages" :key="i" class="msg" :class="m.role">
-        {{ m.content }}
+        <div v-if="m.role === 'assistant'" class="markdown-content" v-html="renderMarkdown(m.content)"></div>
+        <div v-else>{{ m.content }}</div>
         <span v-if="m.role === 'assistant' && i === currentAssistantIdx && busy && awaitingFirstToken" class="typing-indicator">
           <span></span><span></span><span></span>
         </span>
@@ -133,12 +211,17 @@ async function stop() {
   </section>
 </template>
 
+<style>
+/* Thème highlight.js sombre cohérent avec le fond #0d1117 */
+@import "highlight.js/styles/github-dark.css";
+</style>
+
 <style scoped>
 .chat { display: flex; flex-direction: column; height: 100%; max-width: 820px; margin: 0 auto; padding: 1rem 1.5rem; box-sizing: border-box; }
 header { display: flex; gap: 0.75rem; justify-content: space-between; margin-bottom: 0.75rem; }
-.messages { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 0.6rem; padding: 0.5rem 0; }
-.msg { white-space: pre-wrap; padding: 0.6rem 0.9rem; border-radius: 10px; max-width: 85%; line-height: 1.45; }
-.msg.user { align-self: flex-end; background: #3b82f633; }
+.messages { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 0.4rem; padding: 0.5rem 0; }
+.msg { padding: 0.5rem 0.8rem; border-radius: 10px; max-width: 85%; line-height: 1.45; }
+.msg.user { white-space: pre-wrap; align-self: flex-end; background: #3b82f633; }
 .msg.assistant { align-self: flex-start; background: #8882; }
 .stopped-hint { display: block; font-size: 0.7rem; color: #6b7280; margin-top: 0.25rem; }
 .typing-indicator { display: flex; gap: 4px; align-items: center; margin: 0.5rem 0 0; font-size: 0.9rem; color: #666; align-self: flex-start; }
@@ -153,4 +236,145 @@ button.stop:disabled { opacity: 0.5; cursor: not-allowed; }
 .error { color: #d73a49; margin: 0.4rem 0; }
 form { display: flex; gap: 0.6rem; align-items: flex-end; margin-top: 0.5rem; }
 textarea { flex: 1; resize: none; padding: 0.55rem; border-radius: 8px; border: 1px solid #8884; font: inherit; }
+
+/* Rendu markdown des réponses assistant (:deep car v-html injecte du HTML sans data-v) */
+.msg.assistant :deep(.markdown-content p),
+.msg.assistant :deep(.markdown-content ul),
+.msg.assistant :deep(.markdown-content ol),
+.msg.assistant :deep(.markdown-content blockquote),
+.msg.assistant :deep(.markdown-content pre),
+.msg.assistant :deep(.markdown-content h1),
+.msg.assistant :deep(.markdown-content h2),
+.msg.assistant :deep(.markdown-content h3),
+.msg.assistant :deep(.markdown-content h4),
+.msg.assistant :deep(.markdown-content h5),
+.msg.assistant :deep(.markdown-content h6),
+.msg.assistant :deep(.markdown-content hr),
+.msg.assistant :deep(.markdown-content table),
+.msg.assistant :deep(.markdown-content dl) {
+  margin: 0.4rem 0;
+}
+.msg.assistant :deep(.markdown-content p:first-child),
+.msg.assistant :deep(.markdown-content ul:first-child),
+.msg.assistant :deep(.markdown-content ol:first-child),
+.msg.assistant :deep(.markdown-content blockquote:first-child),
+.msg.assistant :deep(.markdown-content pre:first-child),
+.msg.assistant :deep(.markdown-content h1:first-child),
+.msg.assistant :deep(.markdown-content h2:first-child),
+.msg.assistant :deep(.markdown-content h3:first-child),
+.msg.assistant :deep(.markdown-content h4:first-child),
+.msg.assistant :deep(.markdown-content h5:first-child),
+.msg.assistant :deep(.markdown-content h6:first-child),
+.msg.assistant :deep(.markdown-content hr:first-child),
+.msg.assistant :deep(.markdown-content table:first-child),
+.msg.assistant :deep(.markdown-content dl:first-child) {
+  margin-top: 0;
+}
+.msg.assistant :deep(.markdown-content p:last-child),
+.msg.assistant :deep(.markdown-content ul:last-child),
+.msg.assistant :deep(.markdown-content ol:last-child),
+.msg.assistant :deep(.markdown-content blockquote:last-child),
+.msg.assistant :deep(.markdown-content pre:last-child),
+.msg.assistant :deep(.markdown-content h1:last-child),
+.msg.assistant :deep(.markdown-content h2:last-child),
+.msg.assistant :deep(.markdown-content h3:last-child),
+.msg.assistant :deep(.markdown-content h4:last-child),
+.msg.assistant :deep(.markdown-content h5:last-child),
+.msg.assistant :deep(.markdown-content h6:last-child),
+.msg.assistant :deep(.markdown-content hr:last-child),
+.msg.assistant :deep(.markdown-content table:last-child),
+.msg.assistant :deep(.markdown-content dl:last-child) {
+  margin-bottom: 0;
+}
+.msg.assistant :deep(.markdown-content ul),
+.msg.assistant :deep(.markdown-content ol) {
+  padding-left: 1.5rem;
+}
+.msg.assistant :deep(.markdown-content li) {
+  margin: 0.25rem 0;
+}
+.msg.assistant :deep(.markdown-content blockquote) {
+  border-left: 4px solid #3b82f6;
+  padding-left: 0.8rem;
+  color: #4b5563;
+  font-style: italic;
+}
+.msg.assistant :deep(.markdown-content h1), .msg.assistant :deep(.markdown-content h2), .msg.assistant :deep(.markdown-content h3) {
+  font-weight: 600;
+  color: #111827;
+}
+.msg.assistant :deep(.markdown-content h1) { font-size: 1.3rem; }
+.msg.assistant :deep(.markdown-content h2) { font-size: 1.2rem; }
+.msg.assistant :deep(.markdown-content h3) { font-size: 1.1rem; }
+.msg.assistant :deep(.markdown-content hr) {
+  border: none;
+  border-top: 1px solid #e5e7eb;
+}
+
+/* Blocs de code : fond sombre fixe, identique clair/sombre */
+.msg.assistant :deep(.markdown-content pre) {
+  background: #0d1117 !important;
+  color: #c9d1d9 !important;
+  padding: 0.75rem 1rem !important;
+  border-radius: 0 0 6px 6px !important;
+  overflow-x: auto;
+  margin: 0 !important;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.85rem;
+  line-height: 1.5;
+}
+.msg.assistant :deep(.markdown-content pre code) {
+  background: transparent !important;
+  padding: 0 !important;
+  font-size: inherit !important;
+  color: inherit !important;
+  font-family: inherit !important;
+}
+
+/* Barre d'en-tête du bloc de code */
+.msg.assistant :deep(.code-wrapper) {
+  position: relative;
+  margin-top: 0;
+}
+.msg.assistant :deep(.code-header) {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.4rem 0.75rem;
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-bottom: none;
+  border-top-left-radius: 6px;
+  border-top-right-radius: 6px;
+  gap: 0.75rem;
+}
+.msg.assistant :deep(.code-lang) {
+  font-size: 0.75rem;
+  color: #8b949e;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+}
+
+/* Bouton Copier : style sobre, pas en position absolue */
+.msg.assistant :deep(.copy-btn) {
+  display: inline-flex;
+  align-items: center;
+  font-size: 0.75rem;
+  padding: 0.15rem 0.5rem;
+  background: transparent;
+  color: #8b949e;
+  border: 1px solid #30363d;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s;
+  margin-left: auto;
+}
+.msg.assistant :deep(.copy-btn:hover) {
+  border-color: #8b949e;
+  color: #c9d1d9;
+  background: #21262d;
+}
+.msg.assistant :deep(.copy-btn:focus) {
+  outline: 2px solid #58a6ff;
+  outline-offset: 1px;
+}
 </style>
