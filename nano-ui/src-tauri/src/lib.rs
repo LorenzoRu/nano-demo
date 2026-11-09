@@ -39,12 +39,21 @@ async fn chat(
     )
     .await;
 
+    // Détermine si l'annulation a été demandée avant de libérer l'état.
+    let cancelled = {
+        let guard = state.cancel.lock().map_err(|e| e.to_string())?;
+        guard.as_ref().map_or(false, |c| c.load(Ordering::Relaxed))
+    };
+
     // Libère l'état même en cas d'erreur (annulation ou échec réseau).
     {
         let mut guard = state.cancel.lock().map_err(|e| e.to_string())?;
         *guard = None;
     }
 
+    if cancelled {
+        return Ok(());
+    }
     result.map_err(|e| e.to_string())
 }
 
