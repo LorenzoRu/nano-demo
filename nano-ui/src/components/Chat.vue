@@ -16,6 +16,7 @@ const model = ref("");
 const messages = ref<ChatMessage[]>([]);
 const input = ref("");
 const busy = ref(false);
+const stopping = ref(false);
 const error = ref<string | null>(null);
 const list = ref<HTMLElement | null>(null);
 
@@ -51,13 +52,30 @@ async function send() {
   };
 
   busy.value = true;
+  stopping.value = false;
   try {
     await invoke("chat", { model: model.value, messages: history, onToken });
   } catch (e) {
-    error.value = String(e);
+    // Si l'annulation a été demandée, ce n'est pas une erreur utilisateur.
+    if (!stopping.value) {
+      error.value = String(e);
+    }
     if (messages.value[idx].content === "") messages.value.splice(idx, 1);
   } finally {
     busy.value = false;
+    stopping.value = false;
+  }
+}
+
+async function stop() {
+  stopping.value = true;
+  try {
+    await invoke("cancel_chat");
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    busy.value = false;
+    stopping.value = false;
   }
 }
 </script>
@@ -72,6 +90,7 @@ async function send() {
       <button :disabled="busy || messages.length === 0" @click="messages = []">
         Nouvelle conversation
       </button>
+      <button :disabled="!busy" @click="stop" class="stop">Stop</button>
     </header>
 
     <div ref="list" class="messages">
@@ -100,6 +119,8 @@ header { display: flex; gap: 0.75rem; justify-content: space-between; margin-bot
 .msg { white-space: pre-wrap; padding: 0.6rem 0.9rem; border-radius: 10px; max-width: 85%; line-height: 1.45; }
 .msg.user { align-self: flex-end; background: #3b82f633; }
 .msg.assistant { align-self: flex-start; background: #8882; }
+button.stop { background: #d73a49; color: #fff; border: none; border-radius: 6px; padding: 0.25rem 0.75rem; cursor: pointer; }
+button.stop:disabled { opacity: 0.5; cursor: not-allowed; }
 .hint { opacity: 0.6; text-align: center; margin-top: 2rem; }
 .error { color: #d73a49; margin: 0.4rem 0; }
 form { display: flex; gap: 0.6rem; align-items: flex-end; margin-top: 0.5rem; }
