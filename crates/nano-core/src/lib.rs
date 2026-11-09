@@ -1,5 +1,5 @@
 use futures_util::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 pub mod status; 
@@ -16,23 +16,29 @@ struct Message {
     content: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
 /// Envoie un prompt à Ollama et appelle `on_token` pour chaque morceau reçu.
 pub async fn stream_chat(
-    model: &str,
-    prompt: &str,
+      model: &str,
+    messages: &[ChatMessage],
     mut on_token: impl FnMut(&str),
 ) -> anyhow::Result<()> {
     let res = reqwest::Client::new()
         .post("http://localhost:11434/api/chat")
         .json(&json!({
             "model": model,
-            "messages": [{ "role": "user", "content": prompt }],
+            "messages": messages,
             "stream": true
         }))
         .send()
         .await?
         .error_for_status()?;
-
+ 
     let mut stream = res.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
 
