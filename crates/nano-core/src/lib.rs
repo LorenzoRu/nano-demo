@@ -2,6 +2,8 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 
+pub mod status; 
+
 #[derive(Deserialize)]
 struct ChatChunk {
     message: Option<Message>,
