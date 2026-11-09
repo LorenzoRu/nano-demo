@@ -1,0 +1,9 @@
+[package]
+name = "nano-app"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+nano-core = { version = "0.1.0", path = "../nano-core" }
+tokio = { version = "1.54.1", features = ["full"] }

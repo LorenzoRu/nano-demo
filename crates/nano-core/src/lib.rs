@@ -1,0 +1,55 @@
+use futures_util::StreamExt;
+use serde::Deserialize;
+use serde_json::json;
+
+#[derive(Deserialize)]
+struct ChatChunk {
+    message: Option<Message>,
+    #[serde(default)]
+    done: bool,
+}
+
+#[derive(Deserialize)]
+struct Message {
+    content: String,
+}
+
+/// Envoie un prompt à Ollama et appelle `on_token` pour chaque morceau reçu.
+pub async fn stream_chat(
+    model: &str,
+    prompt: &str,
+    mut on_token: impl FnMut(&str),
+) -> anyhow::Result<()> {
+    let res = reqwest::Client::new()
+        .post("http://localhost:11434/api/chat")
+        .json(&json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": prompt }],
+            "stream": true
+        }))
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let mut stream = res.bytes_stream();
+    let mut buf: Vec<u8> = Vec::new();
+
+    while let Some(chunk) = stream.next().await {
+        buf.extend_from_slice(&chunk?);
+        // Le NDJSON peut être coupé en plein milieu d'une ligne : on ne parse que les lignes complètes.
+        while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+            let line: Vec<u8> = buf.drain(..=pos).collect();
+            if line.trim_ascii().is_empty() {
+                continue;
+            }
+            let parsed: ChatChunk = serde_json::from_slice(&line)?;
+            if let Some(m) = parsed.message {
+                on_token(&m.content);
+            }
+            if parsed.done {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
