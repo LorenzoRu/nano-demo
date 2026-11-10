@@ -221,21 +221,21 @@ async function stop() {
 header { display: flex; gap: 0.75rem; justify-content: space-between; margin-bottom: 0.75rem; }
 .messages { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 0.4rem; padding: 0.5rem 0; }
 .msg { padding: 0.5rem 0.8rem; border-radius: 10px; max-width: 85%; line-height: 1.45; }
-.msg.user { white-space: pre-wrap; align-self: flex-end; background: #3b82f633; }
-.msg.assistant { align-self: flex-start; background: #8882; }
-.stopped-hint { display: block; font-size: 0.7rem; color: #6b7280; margin-top: 0.25rem; }
-.typing-indicator { display: flex; gap: 4px; align-items: center; margin: 0.5rem 0 0; font-size: 0.9rem; color: #666; align-self: flex-start; }
-.typing-indicator span { width: 8px; height: 8px; border-radius: 50%; background: #9ca3af; animation: typing 1.4s infinite ease-in-out both; }
+.msg.user { white-space: pre-wrap; align-self: flex-end; background: var(--color-user-msg); }
+.msg.assistant { align-self: flex-start; background: var(--color-assistant-msg); }
+.stopped-hint { display: block; font-size: 0.7rem; color: var(--color-hint); margin-top: 0.25rem; }
+.typing-indicator { display: flex; gap: 4px; align-items: center; margin: 0.5rem 0 0; font-size: 0.9rem; color: var(--color-text-muted); align-self: flex-start; }
+.typing-indicator span { width: 8px; height: 8px; border-radius: 50%; background: var(--color-typing-dot); animation: typing 1.4s infinite ease-in-out both; }
 .typing-indicator span:nth-child(1) { animation-delay: 0s; }
 .typing-indicator span:nth-child(2) { animation-delay: 0.2s; }
 .typing-indicator span:nth-child(3) { animation-delay: 0.4s; }
 @keyframes typing { 0%, 100% { opacity: 0.4; transform: scale(1); } 50% { opacity: 1; transform: scale(1.2); } }
-button.stop { background: #d73a49; color: #fff; border: none; border-radius: 6px; padding: 0.25rem 0.75rem; cursor: pointer; }
+button.stop { background: var(--color-stop-bg); color: var(--color-stop-text); border: none; border-radius: 6px; padding: 0.25rem 0.75rem; cursor: pointer; }
 button.stop:disabled { opacity: 0.5; cursor: not-allowed; }
 .hint { opacity: 0.6; text-align: center; margin-top: 2rem; }
-.error { color: #d73a49; margin: 0.4rem 0; }
+.error { color: var(--color-error); margin: 0.4rem 0; }
 form { display: flex; gap: 0.6rem; align-items: flex-end; margin-top: 0.5rem; }
-textarea { flex: 1; resize: none; padding: 0.55rem; border-radius: 8px; border: 1px solid #8884; font: inherit; }
+textarea { flex: 1; resize: none; padding: 0.55rem; border-radius: 8px; border: 1px solid var(--color-textarea-border); font: inherit; }
 
 /* Rendu markdown des réponses assistant (:deep car v-html injecte du HTML sans data-v) */
 .msg.assistant :deep(.markdown-content p),
@@ -294,27 +294,27 @@ textarea { flex: 1; resize: none; padding: 0.55rem; border-radius: 8px; border: 
   margin: 0.25rem 0;
 }
 .msg.assistant :deep(.markdown-content blockquote) {
-  border-left: 4px solid #3b82f6;
+  border-left: 4px solid var(--color-blockquote-border);
   padding-left: 0.8rem;
-  color: #4b5563;
+  color: var(--color-blockquote-text);
   font-style: italic;
 }
 .msg.assistant :deep(.markdown-content h1), .msg.assistant :deep(.markdown-content h2), .msg.assistant :deep(.markdown-content h3) {
   font-weight: 600;
-  color: #111827;
+  color: var(--color-heading);
 }
 .msg.assistant :deep(.markdown-content h1) { font-size: 1.3rem; }
 .msg.assistant :deep(.markdown-content h2) { font-size: 1.2rem; }
 .msg.assistant :deep(.markdown-content h3) { font-size: 1.1rem; }
 .msg.assistant :deep(.markdown-content hr) {
   border: none;
-  border-top: 1px solid #e5e7eb;
+  border-top: 1px solid var(--color-hr);
 }
 
 /* Blocs de code : fond sombre fixe, identique clair/sombre */
 .msg.assistant :deep(.markdown-content pre) {
-  background: #0d1117 !important;
-  color: #c9d1d9 !important;
+  background: var(--color-code-bg) !important;
+  color: var(--color-code-text) !important;
   padding: 0.75rem 1rem !important;
   border-radius: 0 0 6px 6px !important;
   overflow-x: auto;
@@ -341,8 +341,8 @@ textarea { flex: 1; resize: none; padding: 0.55rem; border-radius: 8px; border: 
   align-items: center;
   justify-content: space-between;
   padding: 0.4rem 0.75rem;
-  background: #161b22;
-  border: 1px solid #30363d;
+  background: var(--color-code-header-bg);
+  border: 1px solid var(--color-code-header-border);
   border-bottom: none;
   border-top-left-radius: 6px;
   border-top-right-radius: 6px;
@@ -350,7 +350,7 @@ textarea { flex: 1; resize: none; padding: 0.55rem; border-radius: 8px; border: 
 }
 .msg.assistant :deep(.code-lang) {
   font-size: 0.75rem;
-  color: #8b949e;
+  color: var(--color-code-lang);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
 }
 
@@ -361,17 +361,17 @@ textarea { flex: 1; resize: none; padding: 0.55rem; border-radius: 8px; border: 
   font-size: 0.75rem;
   padding: 0.15rem 0.5rem;
   background: transparent;
-  color: #8b949e;
-  border: 1px solid #30363d;
+  color: var(--color-code-lang);
+  border: 1px solid var(--color-code-header-border);
   border-radius: 4px;
   cursor: pointer;
   transition: all 0.15s;
   margin-left: auto;
 }
 .msg.assistant :deep(.copy-btn:hover) {
-  border-color: #8b949e;
-  color: #c9d1d9;
-  background: #21262d;
+  border-color: var(--color-code-lang);
+  color: var(--color-code-text);
+  background: var(--color-bg-panel);
 }
 .msg.assistant :deep(.copy-btn:focus) {
   outline: 2px solid #58a6ff;

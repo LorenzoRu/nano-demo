@@ -93,14 +93,14 @@ function formatDate(iso: string) {
 header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1.5rem; }
 h1 { margin: 0; font-size: 1.6rem; }
 h2 { font-size: 1.05rem; margin: 1.5rem 0 0.75rem; }
-.badge { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.35rem 0.8rem; border-radius: 999px; border: 1px solid #8884; font-size: 0.9rem; }
+.badge { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.35rem 0.8rem; border-radius: 999px; border: 1px solid var(--color-badge-border); font-size: 0.9rem; }
 .badge small { opacity: 0.6; }
-.dot { width: 0.6rem; height: 0.6rem; border-radius: 50%; background: #888; }
-.ok .dot { background: #2ea043; }
-.ko .dot { background: #d73a49; }
+.dot { width: 0.6rem; height: 0.6rem; border-radius: 50%; background: var(--color-badge-dot); }
+.ok .dot { background: var(--color-badge-dot-ok); }
+.ko .dot { background: var(--color-badge-dot-ko); }
 .hint { opacity: 0.7; }
 table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
-th, td { text-align: left; padding: 0.55rem 0.6rem; border-bottom: 1px solid #8883; }
+th, td { text-align: left; padding: 0.55rem 0.6rem; border-bottom: 1px solid var(--color-table-border); }
 th { font-weight: 600; opacity: 0.7; }
-code { background: #8882; padding: 0.1rem 0.35rem; border-radius: 4px; }
+code { background: var(--color-code-inline-bg); padding: 0.1rem 0.35rem; border-radius: 4px; }
 </style>
