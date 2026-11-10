@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, nextTick } from "vue";
+import { ref, onMounted, nextTick, watch } from "vue";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { marked } from "marked";
 import hljs from "highlight.js";
@@ -25,6 +25,33 @@ const list = ref<HTMLElement | null>(null);
 const stoppedByUserIdx = ref<number | null>(null);
 const currentAssistantIdx = ref<number | null>(null);
 const awaitingFirstToken = ref(false);
+
+// Clé de persistance de la conversation courante dans localStorage
+const STORAGE_KEY = "nano-conversation";
+
+function saveMessages() {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(messages.value));
+  } catch {
+    // localStorage indisponible ou quota dépassé : on ignore silencieusement
+  }
+}
+
+function loadMessages(): ChatMessage[] {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as ChatMessage[];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+// Restaure la conversation sauvegardée au montage, puis autosauvegarde à chaque changement
+watch(messages, () => {
+  saveMessages();
+}, { deep: true });
 
 async function copyToClipboard(text: string) {
   try {
@@ -104,6 +131,10 @@ function onMessageClick(evt: MouseEvent) {
 }
 
 onMounted(async () => {
+  // Restaure la conversation sauvegardée (si aucune Ollama n'est joignable,
+  // l'historique local reste accessible).
+  messages.value = loadMessages();
+
   try {
     const status = await invoke<OllamaStatus>("get_ollama_status");
     models.value = status.models.map((m) => m.name);
