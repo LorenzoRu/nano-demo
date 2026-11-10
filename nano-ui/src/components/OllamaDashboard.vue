@@ -89,7 +89,7 @@ function formatDate(iso: string) {
 </template>
 
 <style scoped>
-.dashboard { max-width: 760px; margin: 0 auto; padding: 2rem 1.5rem; }
+.dashboard { width: 100%; max-width: none; padding: 2rem 1.5rem; box-sizing: border-box; }
 header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1.5rem; }
 h1 { margin: 0; font-size: 1.6rem; }
 h2 { font-size: 1.05rem; margin: 1.5rem 0 0.75rem; }

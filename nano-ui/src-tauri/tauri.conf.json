@@ -13,8 +13,14 @@
     "windows": [
       {
         "title": "nano-ui",
-        "width": 800,
-        "height": 600
+        "width": 1280,
+        "height": 720,
+        "minWidth": 1280,
+        "minHeight": 720,
+        "resizable": true,
+        "minimizable": true,
+        "maximizable": true,
+        "fullscreen": false
       }
     ],
     "security": {

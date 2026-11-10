@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, watch, onMounted } from "vue";
+import { invoke } from "@tauri-apps/api/core";
 import Chat from "./components/Chat.vue";
 import OllamaDashboard from "./components/OllamaDashboard.vue";
 
@@ -12,6 +13,13 @@ const isDark = ref(stored ? stored === "dark" : true);
 function toggleTheme() {
   isDark.value = !isDark.value;
 }
+
+async function toggleFullscreen() {
+  await invoke("toggle_fullscreen");
+}
+
+const fullscreenIcon = "Plein écran";
+const fullscreenLabel = "Basculer en plein écran";
 
 onMounted(() => {
   updateRootClass();
@@ -36,7 +44,10 @@ function updateRootClass() {
         Tableau de bord
       </button>
       <button class="theme-toggle" @click="toggleTheme" :aria-label="isDark ? 'Passer en mode clair' : 'Passer en mode sombre'">
-        {{ isDark ? "☀️" : "🌙" }}
+        {{ isDark ? "Passer en mode clair" : "Passer en mode sombre" }}
+      </button>
+      <button class="fullscreen-toggle" @click="toggleFullscreen" :aria-label="fullscreenLabel">
+        {{ fullscreenIcon }}
       </button>
     </nav>
     <div class="content">
@@ -120,20 +131,32 @@ function updateRootClass() {
 
 html, body, #app { height: 100%; margin: 0; }
 
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
 body {
   background: var(--color-bg);
   color: var(--color-text);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Noto Color Emoji", "Segoe UI Emoji", "Apple Color Emoji", sans-serif;
   transition: background-color 0.2s, color 0.2s;
 }
-</style>
 
-<style scoped>
-.app { display: flex; flex-direction: column; height: 100%; }
-nav { display: flex; gap: 0.5rem; padding: 0.6rem 1rem; border-bottom: 1px solid var(--color-nav-border); }
+nav {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.6rem 1rem;
+  border-bottom: 1px solid var(--color-nav-border);
+}
+
 nav button.active { font-weight: 600; text-decoration: underline; }
 .theme-toggle { background: none; border: none; cursor: pointer; font-size: 1.1rem; padding: 0.2rem; color: var(--color-text); }
 .theme-toggle:hover { opacity: 0.8; }
-.content { flex: 1; min-height: 0; }
-.content > * { height: 100%; }
+.fullscreen-toggle { background: none; border: none; cursor: pointer; font-size: 1.1rem; padding: 0.2rem; color: var(--color-text); }
+.fullscreen-toggle:hover { opacity: 0.8; }
+.content { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.content > * { flex: 1; min-height: 0; }
 .scroll { overflow-y: auto; }
 </style>
