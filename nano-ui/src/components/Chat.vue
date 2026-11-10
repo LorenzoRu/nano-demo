@@ -52,6 +52,8 @@ const currentConversationTitle = ref("");
 const isPasswordModalOpen = ref(false);
 const passwordInput = ref("");
 const pendingConversationId = ref<string | null>(null); // id à déverrouiller
+const editingConversationId = ref<string | null>(null); // id en cours de renommage
+const editTitle = ref(""); // titre en cours d'édition
 
 /* ---------- Formatage ---------- */
 function formatSize(bytes: number): string {
@@ -229,13 +231,17 @@ async function saveCurrentConversation() {
   if (!title) title = "Nouvelle conversation";
 
   try {
+    const size_bytes = messages.value.reduce((acc, m) => acc + m.content.length, 0);
     await invoke("conversation_save", {
-      id: currentConversationId.value,
-      title,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-      password_hash: null,
-      messages: messages.value,
+      conv: {
+        id: currentConversationId.value,
+        title,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+        password_hash: null,
+        size_bytes,
+        messages: messages.value,
+      },
     });
     await loadConversations();
     error.value = null;
@@ -261,17 +267,39 @@ async function deleteConversation(id: string) {
   }
 }
 
-async function renameConversation(id: string, newTitle: string) {
-  if (!newTitle.trim()) return;
+async function startRename(id: string, currentTitle: string) {
+  editingConversationId.value = id;
+  editTitle.value = currentTitle;
+  // Focus sur l'input après le prochain rendu
+  nextTick(() => {
+    const input = document.querySelector(`input.edit-title[data-id="${id}"]`) as HTMLInputElement | null;
+    input?.focus();
+    input?.select();
+  });
+}
+
+async function saveRename(id: string) {
+  const newTitle = editTitle.value.trim();
+  if (!newTitle || newTitle === conversations.value.find((c) => c.id === id)?.title) {
+    cancelRename();
+    return;
+  }
   try {
-    await invoke("conversation_rename", { id, title: newTitle.trim() });
+    await invoke("conversation_rename", { id, title: newTitle });
     await loadConversations();
     if (currentConversationId.value === id) {
-      currentConversationTitle.value = newTitle.trim();
+      currentConversationTitle.value = newTitle;
     }
   } catch (e) {
     error.value = String(e);
+  } finally {
+    cancelRename();
   }
+}
+
+function cancelRename() {
+  editingConversationId.value = null;
+  editTitle.value = "";
 }
 
 /* ---------- Initialisation ---------- */
@@ -376,12 +404,46 @@ async function stop() {
             class="sidebar-item-btn"
             :title="c.title"
           >
-            <span class="item-title">{{ c.title }}</span>
+            <span
+              v-if="editingConversationId !== c.id"
+              class="item-title"
+            >
+              {{ c.title }}
+            </span>
+            <input
+              v-else
+              type="text"
+              class="item-title edit-title"
+              v-model="editTitle"
+              :data-id="c.id"
+              @keyup.enter="saveRename(c.id)"
+              @keyup.esc="cancelRename"
+            />
             <span class="item-size">{{ formatSize(c.size_bytes) }}</span>
             <span v-if="c.has_password" class="item-lock">Verrou</span>
           </button>
           <div class="item-actions">
-            <button class="btn-rename" @click.stop="renameConversation(c.id, c.title)">Renommer</button>
+            <button
+              v-if="editingConversationId !== c.id"
+              class="btn-rename"
+              @click.stop="startRename(c.id, c.title)"
+            >
+              Renommer
+            </button>
+            <button
+              v-if="editingConversationId === c.id"
+              class="btn-save"
+              @click.stop="saveRename(c.id)"
+            >
+              Enregistrer
+            </button>
+            <button
+              v-if="editingConversationId === c.id"
+              class="btn-cancel"
+              @click.stop="cancelRename"
+            >
+              Annuler
+            </button>
             <button class="btn-delete" @click.stop="deleteConversation(c.id)">Supprimer</button>
           </div>
         </li>
@@ -869,4 +931,27 @@ textarea {
   cursor: pointer;
 }
 .modal-actions button:hover { background: var(--color-bg); }
+
+/* Input d'édition du titre dans la sidebar */
+.item-title.edit-title {
+  flex: 1;
+  font: inherit;
+  color: var(--color-text);
+  background: transparent;
+  border: 1px solid var(--color-border-hover);
+  border-radius: 4px;
+  padding: 0.2rem 0.4rem;
+  outline: none;
+}
+.item-title.edit-title:focus { border-color: #58a6ff; }
+
+.btn-save, .btn-cancel {
+  background: none;
+  border: none;
+  color: var(--color-text-muted);
+  cursor: pointer;
+  padding: 0.15rem;
+}
+.btn-save:hover { color: var(--color-text); }
+.btn-cancel:hover { color: var(--color-error); }
 </style>
