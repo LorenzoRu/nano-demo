@@ -55,6 +55,11 @@ const pendingConversationId = ref<string | null>(null); // id à déverrouiller
 const editingConversationId = ref<string | null>(null); // id en cours de renommage
 const editTitle = ref(""); // titre en cours d'édition
 
+/* ---------- Paramètres de conversation ---------- */
+const systemPrompt = ref(""); // prompt système de la conversation courante
+const contextLimit = ref(20); // limite de contexte (nb messages en brut)
+const isSettingsOpen = ref(false); // panneau paramètres ouvert ?
+
 /* ---------- Formatage ---------- */
 function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} o`;
@@ -178,6 +183,10 @@ async function loadConversationMessages(id: string) {
     currentConversationTitle.value = conv.title;
     messages.value = conv.messages;
     model.value = models.value[0] ?? "";
+    // Charge les paramètres de la conversation (prompt système + contexte)
+    const settings = await invoke<{ system_prompt: string; context_limit: number }>("get_settings", { id });
+    systemPrompt.value = settings.system_prompt;
+    contextLimit.value = settings.context_limit ?? 20;
     error.value = null;
   } catch (e) {
     error.value = String(e);
@@ -240,10 +249,28 @@ async function saveCurrentConversation() {
         updated_at: new Date().toISOString(),
         password_hash: null,
         size_bytes,
+        system_prompt: systemPrompt.value,
+        context_limit: contextLimit.value,
         messages: messages.value,
       },
     });
     await loadConversations();
+    error.value = null;
+  } catch (e) {
+    error.value = String(e);
+  }
+}
+
+async function saveSettings() {
+  if (!currentConversationId.value) return;
+  try {
+    await invoke("save_settings", {
+      id: currentConversationId.value,
+      settings: {
+        system_prompt: systemPrompt.value,
+        context_limit: contextLimit.value,
+      },
+    });
     error.value = null;
   } catch (e) {
     error.value = String(e);
@@ -348,7 +375,19 @@ async function send() {
   busy.value = true;
   stopping.value = false;
   try {
-    await invoke("chat", { model: model.value, messages: history, onToken });
+    // Valeur par défaut 20 si le champ est vide ou invalide (0, NaN, null).
+    const rawLimit = contextLimit.value;
+    const limit =
+      rawLimit != null && !Number.isNaN(rawLimit) && rawLimit > 0
+        ? rawLimit
+        : 20;
+    await invoke("chat", {
+      model: model.value,
+      messages: history,
+      systemPrompt: systemPrompt.value,
+      contextLimit: limit,
+      onToken,
+    });
     // Met à jour le titre affiché si un premier message utilisateur existe
     const firstUser = messages.value.find((m) => m.role === "user");
     if (firstUser) {
@@ -358,16 +397,14 @@ async function send() {
       }
     }
   } catch (e) {
-    if (!stopping.value) {
-      error.value = String(e);
-    }
+    error.value = String(e);
     if (messages.value[idx].content === "") messages.value.splice(idx, 1);
   } finally {
     busy.value = false;
     stopping.value = false;
     awaitingFirstToken.value = false;
     currentAssistantIdx.value = null;
-    // Sauvegarde automatique dans SQLite après réception complète (busy est déjà false)
+    // Sauvegarde automatique dans SQLite après réception complète
     await saveCurrentConversation();
   }
 }
@@ -470,8 +507,41 @@ async function stop() {
           <button :disabled="busy" @click="createConversation">
             Nouvelle conversation
           </button>
+          <button
+            class="btn-settings"
+            @click="isSettingsOpen = !isSettingsOpen"
+            :aria-label="isSettingsOpen ? 'Fermer les paramètres' : 'Ouvrir les paramètres'"
+          >
+            ⚙️
+          </button>
         </div>
       </header>
+
+      <!-- Panneau paramètres de la conversation -->
+      <div v-if="isSettingsOpen && currentConversationId" class="settings-panel">
+        <div class="settings-section">
+          <label class="settings-label">Prompt système</label>
+          <textarea
+            v-model="systemPrompt"
+            rows="3"
+            placeholder="Instruction de rôle pour ce modèle (ex: Tu es un expert développeur...)"
+            @blur="saveSettings"
+          ></textarea>
+          <p class="settings-hint">Envoyé au modèle au début de chaque réponse de cette conversation.</p>
+        </div>
+        <div class="settings-section">
+          <label class="settings-label">Contexte (messages en brut)</label>
+          <input
+            type="number"
+            v-model.number="contextLimit"
+            min="1"
+            max="200"
+            @blur="saveSettings"
+          />
+          <p class="settings-hint">Nombre de derniers messages conservés en brut. Au-delà, les anciens sont résumés (contexte à froid).</p>
+        </div>
+        <button class="btn-settings-close" @click="isSettingsOpen = false">Fermer</button>
+      </div>
 
       <div class="chat-bottom" :class="{ empty: messages.length === 0 }">
         <div ref="list" class="messages" @click="onMessageClick">
@@ -954,4 +1024,73 @@ textarea {
 }
 .btn-save:hover { color: var(--color-text); }
 .btn-cancel:hover { color: var(--color-error); }
+
+/* Bouton paramètres dans le header */
+.btn-settings {
+  background: none;
+  border: 1px solid var(--color-border);
+  color: var(--color-text);
+  cursor: pointer;
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+  font-size: 1rem;
+  margin-left: 0.5rem;
+}
+.btn-settings:hover { background: var(--color-bg); }
+
+/* Panneau paramètres */
+.settings-panel {
+  padding: 1rem;
+  border: 1px solid var(--color-border);
+  background: var(--color-bg-panel);
+  margin: 0.5rem 1rem;
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  animation: fadeIn 0.2s ease;
+}
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+.settings-label {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--color-text-muted);
+}
+.settings-panel textarea,
+.settings-panel input[type="number"] {
+  font: inherit;
+  padding: 0.5rem;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: var(--color-bg);
+  color: var(--color-text);
+}
+.settings-panel textarea:focus,
+.settings-panel input[type="number"]:focus {
+  outline: none;
+  border-color: #58a6ff;
+}
+.settings-hint {
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+  margin: 0;
+}
+.btn-settings-close {
+  align-self: flex-start;
+  background: none;
+  border: 1px solid var(--color-border);
+  color: var(--color-text);
+  padding: 0.25rem 0.75rem;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.btn-settings-close:hover { background: var(--color-bg); }
 </style>
