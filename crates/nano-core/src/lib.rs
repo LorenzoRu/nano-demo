@@ -4,6 +4,9 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+pub mod settings;
+pub mod context;
+
 pub mod status;
 
 #[derive(Deserialize)]

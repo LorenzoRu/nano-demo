@@ -512,7 +512,7 @@ async function stop() {
             @click="isSettingsOpen = !isSettingsOpen"
             :aria-label="isSettingsOpen ? 'Fermer les paramètres' : 'Ouvrir les paramètres'"
           >
-            ⚙️
+            Paramètres
           </button>
         </div>
       </header>
@@ -525,7 +525,6 @@ async function stop() {
             v-model="systemPrompt"
             rows="3"
             placeholder="Instruction de rôle pour ce modèle (ex: Tu es un expert développeur...)"
-            @blur="saveSettings"
           ></textarea>
           <p class="settings-hint">Envoyé au modèle au début de chaque réponse de cette conversation.</p>
         </div>
@@ -536,10 +535,10 @@ async function stop() {
             v-model.number="contextLimit"
             min="1"
             max="200"
-            @blur="saveSettings"
           />
           <p class="settings-hint">Nombre de derniers messages conservés en brut. Au-delà, les anciens sont résumés (contexte à froid).</p>
         </div>
+        <button class="btn-settings-save" @click="saveSettings">Enregistrer</button>
         <button class="btn-settings-close" @click="isSettingsOpen = false">Fermer</button>
       </div>
 
@@ -1083,6 +1082,17 @@ textarea {
   color: var(--color-text-muted);
   margin: 0;
 }
+.btn-settings-save {
+  align-self: flex-start;
+  background: var(--color-user-msg);
+  border: 1px solid var(--color-user-msg);
+  color: var(--color-text);
+  padding: 0.25rem 0.75rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: 600;
+}
+.btn-settings-save:hover { background: var(--color-border-hover); }
 .btn-settings-close {
   align-self: flex-start;
   background: none;
