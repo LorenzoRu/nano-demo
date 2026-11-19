@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, nextTick } from "vue";
+import { ref, onMounted, nextTick, watch } from "vue";
 import { invoke, Channel } from "@tauri-apps/api/core";
 import { marked } from "marked";
 import hljs from "highlight.js";
@@ -59,6 +59,7 @@ const editTitle = ref(""); // titre en cours d'édition
 const systemPrompt = ref(""); // prompt système de la conversation courante
 const contextLimit = ref(20); // limite de contexte (nb messages en brut)
 const isSettingsOpen = ref(false); // panneau paramètres ouvert ?
+const useAgent = ref(false); // mode agent avec outils activé ?
 
 /* ---------- Formatage ---------- */
 function formatSize(bytes: number): string {
@@ -261,6 +262,29 @@ async function saveCurrentConversation() {
   }
 }
 
+/* Sauvegarde différée après le dernier token : la résolution de l'invoke peut arriver
+   avant que tous les messages du canal Tauri soient appliqués côté Vue. */
+let saveTimer: ReturnType<typeof setTimeout> | null = null;
+let saveChain: Promise<void> = Promise.resolve();
+
+function queueSave(): Promise<void> {
+  saveChain = saveChain.then(() => saveCurrentConversation());
+  return saveChain;
+}
+
+watch(
+  messages,
+  () => {
+    if (!currentConversationId.value || busy.value) return;
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      saveTimer = null;
+      void queueSave();
+    }, 400);
+  },
+  { deep: true },
+);
+
 async function saveSettings() {
   if (!currentConversationId.value) return;
   try {
@@ -381,13 +405,16 @@ async function send() {
       rawLimit != null && !Number.isNaN(rawLimit) && rawLimit > 0
         ? rawLimit
         : 20;
-    await invoke("chat", {
-      model: model.value,
-      messages: history,
-      systemPrompt: systemPrompt.value,
-      contextLimit: limit,
-      onToken,
-    });
+    await invoke(
+      useAgent.value ? "chat_agent" : "chat",
+      {
+        model: model.value,
+        messages: history,
+        systemPrompt: systemPrompt.value,
+        contextLimit: limit,
+        onToken,
+      },
+    );
     // Met à jour le titre affiché si un premier message utilisateur existe
     const firstUser = messages.value.find((m) => m.role === "user");
     if (firstUser) {
@@ -405,7 +432,7 @@ async function send() {
     awaitingFirstToken.value = false;
     currentAssistantIdx.value = null;
     // Sauvegarde automatique dans SQLite après réception complète
-    await saveCurrentConversation();
+    await queueSave();
   }
 }
 
@@ -504,6 +531,15 @@ async function stop() {
           <span v-if="currentConversationId" class="conv-size">
             {{ formatSize(messages.reduce((acc: number, m: ChatMessage) => acc + m.content.length, 0)) }}
           </span>
+          <button
+            class="btn-agent"
+            :class="{ active: useAgent }"
+            @click="useAgent = !useAgent"
+            :aria-pressed="useAgent"
+            :title="useAgent ? 'Mode agent avec outils activé' : 'Mode agent avec outils désactivé'"
+          >
+            Mode agent
+          </button>
           <button :disabled="busy" @click="createConversation">
             Nouvelle conversation
           </button>
@@ -1036,6 +1072,24 @@ textarea {
   margin-left: 0.5rem;
 }
 .btn-settings:hover { background: var(--color-bg); }
+
+/* Bouton mode agent */
+.btn-agent {
+  background: none;
+  border: 1px solid var(--color-border);
+  color: var(--color-text);
+  cursor: pointer;
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+  font-size: 0.85rem;
+  margin-left: 0.5rem;
+}
+.btn-agent:hover { background: var(--color-bg); }
+.btn-agent.active {
+  background: var(--color-user-msg);
+  border-color: var(--color-user-msg);
+  font-weight: 600;
+}
 
 /* Panneau paramètres */
 .settings-panel {

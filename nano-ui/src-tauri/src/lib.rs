@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use nano_core::{ChatMessage, context::build_context, settings::ChatSettings};
+use nano_core::{ChatMessage, context::build_context, settings::ChatSettings, tools::{ToolCall, ToolResult, ToolDefinition}};
 use serde::{Deserialize, Serialize};
 use tauri::Listener;
 use tauri::Manager;
@@ -44,6 +44,11 @@ async fn chat(
         *guard = Some(cancel.clone());
     }
 
+    eprintln!(
+        "[nano] chat simple : modèle={model}, messages={}",
+        messages.len()
+    );
+
     // Applique la stratégie de contexte : prompt système + troncature des messages anciens
     let settings = ChatSettings {
         system_prompt,
@@ -66,7 +71,7 @@ async fn chat(
     // Détermine si l'annulation a été demandée avant de libérer l'état.
     let cancelled = {
         let guard = state.cancel.lock().map_err(|e| e.to_string())?;
-        guard.as_ref().map_or(false, |c| c.load(Ordering::Relaxed))
+        guard.as_ref().is_some_and(|c| c.load(Ordering::Relaxed))
     };
 
     // Libère l'état même en cas d'erreur (annulation ou échec réseau).
@@ -88,6 +93,233 @@ fn cancel_chat(state: State<'_, AppState>) -> Result<(), String> {
         cancel.store(true, Ordering::Relaxed);
     }
     Ok(())
+}
+
+/// Définitions des outils disponibles pour le modèle.
+fn tool_read_file() -> ToolDefinition {
+    ToolDefinition {
+        name: "read_file".to_string(),
+        description: "Lit le contenu d'un fichier local et le retourne.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Chemin du fichier à lire" }
+            },
+            "required": ["path"]
+        }),
+    }
+}
+
+fn tool_list_dir() -> ToolDefinition {
+    ToolDefinition {
+        name: "list_dir".to_string(),
+        description: "Liste le contenu d'un dossier local (fichiers et sous-dossiers).".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Chemin du dossier à lister" }
+            },
+            "required": ["path"]
+        }),
+    }
+}
+
+/// Exécute un outil demandé par le modèle.
+async fn execute_tool(tool_call: ToolCall) -> ToolResult {
+    // Accepte une chaîne simple (anciens modèles) ou les clés "path", "file_name" ou "dir".
+    let path = tool_call
+        .arguments
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| {
+            ["path", "file_name", "dir", "directory"]
+                .iter()
+                .find_map(|key| {
+                    tool_call
+                        .arguments
+                        .get(*key)
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                })
+        });
+
+    let Some(path) = path.filter(|value| !value.trim().is_empty()) else {
+        return ToolResult {
+            name: tool_call.name,
+            content: "Argument « path » manquant ou vide.".to_string(),
+            is_error: true,
+        };
+    };
+
+    match tool_call.name.as_str() {
+        "read_file" => {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => ToolResult {
+                    name: tool_call.name,
+                    content,
+                    is_error: false,
+                },
+                Err(e) => ToolResult {
+                    name: tool_call.name,
+                    content: e.to_string(),
+                    is_error: true,
+                },
+            }
+        }
+        "list_dir" => {
+            match std::fs::read_dir(&path) {
+                Ok(entries) => {
+                    let items: Vec<String> = entries
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().to_string())
+                        .collect();
+                    ToolResult {
+                        name: tool_call.name,
+                        content: items.join("\n"),
+                        is_error: false,
+                    }
+                }
+                Err(e) => ToolResult {
+                    name: tool_call.name,
+                    content: e.to_string(),
+                    is_error: true,
+                },
+            }
+        }
+        _ => ToolResult {
+            name: tool_call.name,
+            content: "Outil inconnu".to_string(),
+            is_error: true,
+        },
+    }
+}
+
+// --- Commande chat agent (boucle avec outils) ---
+
+#[tauri::command]
+async fn chat_agent(
+    state: State<'_, AppState>,
+    model: String,
+    messages: Vec<ChatMessage>,
+    system_prompt: String,
+    context_limit: usize,
+    on_token: Channel<String>,
+) -> Result<(), String> {
+    // Remise du drapeau d'annulation à false au début de chaque commande chat.
+    let cancel = Arc::new(AtomicBool::new(false));
+    {
+        let mut guard = state.cancel.lock().map_err(|e| e.to_string())?;
+        *guard = Some(cancel.clone());
+    }
+
+    eprintln!(
+        "[nano][agent] modèle={model}, messages={}, outils=read_file,list_dir",
+        messages.len()
+    );
+    if let Ok(dir) = std::env::current_dir() {
+        eprintln!("[nano][agent] cwd={}", dir.display());
+    }
+
+    // En mode agent, on ajoute toujours les instructions d'outils au prompt système :
+    // si l'utilisateur a défini son propre prompt, un petit modèle peut sinon ignorer les outils.
+    const TOOL_INSTRUCTIONS: &str = "Tu disposes de deux outils : read_file (lire un fichier) et list_dir (lister un dossier).
+Règles :
+- Si l'utilisateur demande de lire un fichier, appelle read_file. Ne réponds jamais que tu ne peux pas accéder aux fichiers.
+- Si l'utilisateur demande de lister un dossier, appelle list_dir.
+- N'invente jamais le contenu d'un fichier : lis-le d'abord avec l'outil.
+- Pour appeler un outil, réponds uniquement avec un JSON de la forme {\"name\":\"read_file\",\"arguments\":{\"path\":\"/chemin/absolu\"}}.
+- Après le résultat d'un outil, réponds uniquement avec la synthèse demandée, de façon concise, sans répéter.
+- Réponds toujours en français.
+- Base-toi uniquement sur le contenu réellement renvoyé par l'outil ; n'invente aucun détail.
+
+Exemple :
+utilisateur : « Lis /tmp/a.txt »
+toi : {\"name\":\"read_file\",\"arguments\":{\"path\":\"/tmp/a.txt\"}}";
+    let system_prompt = if system_prompt.is_empty() {
+        TOOL_INSTRUCTIONS.to_string()
+    } else {
+        format!("{system_prompt}\n\n{TOOL_INSTRUCTIONS}")
+    };
+
+    let settings = ChatSettings {
+        system_prompt,
+        context_limit,
+    };
+    let prepared_messages = build_context(&messages, &settings, &model)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Trace des derniers messages envoyés : permet de voir si un historique de refus
+    // influence le modèle, sans afficher le contenu.
+    for message in prepared_messages.iter().rev().take(3).rev() {
+        eprintln!(
+            "[nano][agent] contexte role={} longueur={}",
+            message.role,
+            message.content.len()
+        );
+    }
+
+    let tools = vec![tool_read_file(), tool_list_dir()];
+
+    let result = nano_core::run_agent_turn(
+        &model,
+        &prepared_messages,
+        &tools,
+        |tool_call| {
+            eprintln!(
+                "[nano][agent] outil demandé : {} {}",
+                tool_call.name, tool_call.arguments
+            );
+            Box::pin(async move {
+                let result = execute_tool(tool_call).await;
+                if result.is_error {
+                    let apercu: String = result.content.chars().take(200).collect();
+                    eprintln!(
+                        "[nano][agent] résultat {} (erreur) : {apercu:?}",
+                        result.name
+                    );
+                } else {
+                    eprintln!(
+                        "[nano][agent] résultat {} : {} octets",
+                        result.name,
+                        result.content.len()
+                    );
+                }
+                result
+            })
+        },
+        |token| {
+            let _ = on_token.send(token.to_string());
+        },
+        &cancel,
+    )
+    .await;
+
+    match &result {
+        Ok(messages) => {
+            eprintln!("[nano][agent] terminé : {} messages", messages.len());
+        }
+        Err(error) => {
+            eprintln!("[nano][agent] erreur : {error:#}");
+        }
+    }
+
+    // Détermine si l'annulation a été demandée avant de libérer l'état.
+    let cancelled = {
+        let guard = state.cancel.lock().map_err(|e| e.to_string())?;
+        guard.as_ref().is_some_and(|c| c.load(Ordering::Relaxed))
+    };
+
+    // Libère l'état même en cas d'erreur (annulation ou échec réseau).
+    {
+        let mut guard = state.cancel.lock().map_err(|e| e.to_string())?;
+        *guard = None;
+    }
+
+    if cancelled {
+        return Ok(());
+    }
+    result.map(|_| ()).map_err(|e| e.to_string())
 }
 
 // --- Commandes de gestion des paramètres de conversation (prompt système + contexte) ---
@@ -285,6 +517,7 @@ pub fn run() {
             get_ollama_status,
             chat,
             cancel_chat,
+            chat_agent,
             get_settings,
             save_settings,
             toggle_fullscreen,
