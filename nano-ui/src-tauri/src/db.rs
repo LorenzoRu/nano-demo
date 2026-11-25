@@ -392,4 +392,70 @@ mod tests {
         assert_eq!(config.root_path, None);
         assert!(config.exclusions.is_empty());
     }
+
+    /// Premier lancement (apk) : schéma complet, aucune donnée préremplie.
+    #[test]
+    fn bdd_vide_au_premier_lancement() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                 ORDER BY name",
+            )
+            .unwrap();
+        let tables: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            tables,
+            vec![
+                "conversations".to_string(),
+                "messages".to_string(),
+                "project".to_string(),
+                "project_exclusions".to_string(),
+            ]
+        );
+
+        assert!(conversation_list(&conn).unwrap().is_empty());
+        let messages: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(messages, 0);
+
+        let project = project_get(&conn).unwrap();
+        assert_eq!(project.root_path, None);
+        assert!(project.exclusions.is_empty());
+
+        // Un redémarrage réinitialise le schéma sans erreur ni donnée ajoutée.
+        init_db(&conn).unwrap();
+        assert!(conversation_list(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn nouvelle_conversation_utilise_les_valeurs_par_defaut() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let conv = conversation_new(&conn, None).unwrap();
+        assert_eq!(conv.title, "Nouvelle conversation");
+        assert_eq!(conv.system_prompt, "");
+        assert_eq!(conv.context_limit, 20);
+        assert!(conv.messages.is_empty());
+
+        let stored = conversation_get(&conn, &conv.id).unwrap().unwrap();
+        assert_eq!(stored.system_prompt, "");
+        assert_eq!(stored.context_limit, 20);
+        assert!(stored.messages.is_empty());
+
+        let item = &conversation_list(&conn).unwrap()[0];
+        assert_eq!(item.system_prompt, "");
+        assert_eq!(item.context_limit, 20);
+        assert!(!item.has_password);
+        assert_eq!(item.size_bytes, 0);
+    }
 }
