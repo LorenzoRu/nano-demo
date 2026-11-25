@@ -31,6 +31,10 @@ interface Conversation {
   size_bytes: number;
   messages: ChatMessage[];
 }
+interface ProjectConfig {
+  root_path: string | null;
+  exclusions: string[];
+}
 
 /* ---------- État ---------- */
 const models = ref<string[]>([]);
@@ -60,6 +64,12 @@ const systemPrompt = ref(""); // prompt système de la conversation courante
 const contextLimit = ref(20); // limite de contexte (nb messages en brut)
 const isSettingsOpen = ref(false); // panneau paramètres ouvert ?
 const useAgent = ref(false); // mode agent avec outils activé ?
+
+/* ---------- Projet lié ---------- */
+const isProjectOpen = ref(false); // panneau projet ouvert ?
+const project = ref<ProjectConfig>({ root_path: null, exclusions: [] });
+const exclusionInput = ref("");
+const projectError = ref<string | null>(null);
 
 /* ---------- Formatage ---------- */
 function formatSize(bytes: number): string {
@@ -301,6 +311,59 @@ async function saveSettings() {
   }
 }
 
+/* ---------- Projet lié ---------- */
+async function loadProject() {
+  try {
+    project.value = await invoke<ProjectConfig>("project_get");
+    projectError.value = null;
+  } catch (e) {
+    projectError.value = String(e);
+  }
+}
+
+async function pickProjectFolder() {
+  if (busy.value) return;
+  try {
+    project.value = await invoke<ProjectConfig>("project_pick_folder");
+    projectError.value = null;
+  } catch (e) {
+    projectError.value = String(e);
+  }
+}
+
+async function clearProject() {
+  if (busy.value) return;
+  if (!confirm("Délier le dossier de projet ? L'agent n'aura plus accès aux fichiers.")) return;
+  try {
+    project.value = await invoke<ProjectConfig>("project_clear");
+    projectError.value = null;
+  } catch (e) {
+    projectError.value = String(e);
+  }
+}
+
+async function addExclusion() {
+  const path = exclusionInput.value.trim();
+  if (!path || !project.value.root_path || busy.value) return;
+  try {
+    project.value = await invoke<ProjectConfig>("project_add_exclusion", { path });
+    exclusionInput.value = "";
+    projectError.value = null;
+  } catch (e) {
+    projectError.value = String(e);
+  }
+}
+
+async function removeExclusion(path: string) {
+  if (busy.value) return;
+  try {
+    project.value = await invoke<ProjectConfig>("project_remove_exclusion", { path });
+    projectError.value = null;
+  } catch (e) {
+    projectError.value = String(e);
+  }
+}
+
 async function deleteConversation(id: string) {
   if (!confirm("Supprimer cette conversation ?")) return;
   try {
@@ -362,6 +425,7 @@ onMounted(async () => {
   } catch (e) {
     error.value = String(e);
   }
+  await loadProject();
   await loadConversations();
 });
 
@@ -544,6 +608,15 @@ async function stop() {
             Nouvelle conversation
           </button>
           <button
+            class="btn-project"
+            :class="{ active: isProjectOpen }"
+            @click="isProjectOpen = !isProjectOpen"
+            :aria-pressed="isProjectOpen"
+            :title="project.root_path ? `Projet : ${project.root_path}` : 'Aucun dossier de projet lié'"
+          >
+            Projet<span v-if="project.root_path" class="project-dot"></span>
+          </button>
+          <button
             class="btn-settings"
             @click="isSettingsOpen = !isSettingsOpen"
             :aria-label="isSettingsOpen ? 'Fermer les paramètres' : 'Ouvrir les paramètres'"
@@ -576,6 +649,53 @@ async function stop() {
         </div>
         <button class="btn-settings-save" @click="saveSettings">Enregistrer</button>
         <button class="btn-settings-close" @click="isSettingsOpen = false">Fermer</button>
+      </div>
+
+      <!-- Panneau du dossier de projet lié (global, indépendant des conversations) -->
+      <div v-if="isProjectOpen" class="settings-panel project-panel">
+        <div class="settings-section">
+          <label class="settings-label">Dossier de projet</label>
+          <code v-if="project.root_path" class="project-path">{{ project.root_path }}</code>
+          <p v-else class="settings-hint">Aucun dossier lié. En mode agent, les outils refuseront tout accès aux fichiers.</p>
+          <div class="project-actions">
+            <button class="btn-settings-save" :disabled="busy" @click="pickProjectFolder">
+              {{ project.root_path ? "Changer de dossier" : "Choisir un dossier" }}
+            </button>
+            <button v-if="project.root_path" class="btn-settings-close" :disabled="busy" @click="clearProject">
+              Délier
+            </button>
+          </div>
+          <p class="settings-hint">L'agent peut lire et modifier ces fichiers sans confirmation. Les chemins hors dossier sont refusés.</p>
+        </div>
+        <div class="settings-section">
+          <label class="settings-label">Exclusions</label>
+          <ul v-if="project.exclusions.length" class="exclusion-list">
+            <li v-for="p in project.exclusions" :key="p">
+              <code>{{ p }}</code>
+              <button class="btn-delete" :disabled="busy" @click="removeExclusion(p)">Retirer</button>
+            </li>
+          </ul>
+          <p v-else class="settings-hint">Aucune exclusion.</p>
+          <div class="project-actions">
+            <input
+              v-model="exclusionInput"
+              type="text"
+              placeholder="chemin/relatif (fichier ou dossier)"
+              :disabled="!project.root_path || busy"
+              @keydown.enter.prevent="addExclusion"
+            />
+            <button
+              class="btn-settings-close"
+              :disabled="!exclusionInput.trim() || !project.root_path || busy"
+              @click="addExclusion"
+            >
+              Exclure
+            </button>
+          </div>
+          <p class="settings-hint">Un fichier ou dossier exclu devient inaccessible en lecture comme en écriture.</p>
+        </div>
+        <p v-if="projectError" class="error">{{ projectError }}</p>
+        <button class="btn-settings-close" @click="isProjectOpen = false">Fermer</button>
       </div>
 
       <div class="chat-bottom" :class="{ empty: messages.length === 0 }">
@@ -1073,6 +1193,33 @@ textarea {
 }
 .btn-settings:hover { background: var(--color-bg); }
 
+/* Bouton projet dans le header */
+.btn-project {
+  position: relative;
+  background: none;
+  border: 1px solid var(--color-border);
+  color: var(--color-text);
+  cursor: pointer;
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+  font-size: 0.85rem;
+}
+.btn-project:hover { background: var(--color-bg); }
+.btn-project.active {
+  background: var(--color-user-msg);
+  border-color: var(--color-user-msg);
+  font-weight: 600;
+}
+.project-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 0.35rem;
+  border-radius: 50%;
+  background: #3fb950;
+  vertical-align: middle;
+}
+
 /* Bouton mode agent */
 .btn-agent {
   background: none;
@@ -1157,4 +1304,63 @@ textarea {
   cursor: pointer;
 }
 .btn-settings-close:hover { background: var(--color-bg); }
+.btn-settings-save:disabled,
+.btn-settings-close:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Panneau projet */
+.project-panel {
+  max-height: 60vh;
+  overflow-y: auto;
+}
+.project-path {
+  font-size: 0.8rem;
+  color: var(--color-text);
+  word-break: break-all;
+  background: var(--color-bg);
+  padding: 0.35rem 0.5rem;
+  border-radius: 4px;
+}
+.project-actions {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.settings-panel input[type="text"] {
+  flex: 1;
+  min-width: 160px;
+  font: inherit;
+  padding: 0.5rem;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: var(--color-bg);
+  color: var(--color-text);
+}
+.settings-panel input[type="text"]:focus {
+  outline: none;
+  border-color: #58a6ff;
+}
+.exclusion-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  max-height: 12rem;
+  overflow-y: auto;
+}
+.exclusion-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  background: var(--color-bg);
+  border-radius: 4px;
+  padding: 0.25rem 0.5rem;
+}
+.exclusion-list code {
+  font-size: 0.8rem;
+  word-break: break-all;
+}
 </style>

@@ -1,4 +1,4 @@
-use rusqlite::{Connection, params, Result as SqlResult};
+use rusqlite::{Connection, OptionalExtension, params, Result as SqlResult};
 use nano_core::{ChatMessage, settings::ChatSettings};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -35,6 +35,15 @@ pub struct ConversationListItem {
     pub context_limit: i64,
 }
 
+/// Dossier de projet lié à nano, avec ses exclusions.
+/// Il n'y a qu'un seul projet pour toute l'application (ligne `id = 1`).
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+pub struct ProjectConfig {
+    pub root_path: Option<String>,
+    /// Exclusions relatives au dossier de projet, séparateurs `/`.
+    pub exclusions: Vec<String>,
+}
+
 /// État partagé de la base de données SQLite.
 pub struct DbState {
     pub conn: std::sync::Mutex<Connection>,
@@ -63,6 +72,15 @@ pub fn init_db(conn: &Connection) -> SqlResult<()> {
             role            TEXT NOT NULL,
             content         TEXT NOT NULL,
             created_at      TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS project (
+            id        INTEGER PRIMARY KEY CHECK (id = 1),
+            root_path TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS project_exclusions (
+            path TEXT PRIMARY KEY
         );
         ",
     )?;
@@ -291,4 +309,87 @@ pub fn conversation_settings_save(
         params![settings.system_prompt, settings.context_limit as i64, now, id],
     )?;
     Ok(())
+}
+
+// --- Projet lié ---
+
+/// Lit le dossier de projet et ses exclusions.
+pub fn project_get(conn: &Connection) -> SqlResult<ProjectConfig> {
+    let root_path: Option<String> = conn
+        .query_row("SELECT root_path FROM project WHERE id = 1", [], |row| row.get(0))
+        .optional()?;
+
+    let mut stmt = conn.prepare("SELECT path FROM project_exclusions ORDER BY path ASC")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut exclusions = Vec::new();
+    for row in rows {
+        exclusions.push(row?);
+    }
+
+    Ok(ProjectConfig {
+        root_path,
+        exclusions,
+    })
+}
+
+/// Lie un dossier de projet. Changer de dossier efface les exclusions précédentes.
+pub fn project_set_root(conn: &Connection, root_path: &str) -> SqlResult<()> {
+    conn.execute(
+        "INSERT INTO project (id, root_path) VALUES (1, ?1)
+         ON CONFLICT(id) DO UPDATE SET root_path = excluded.root_path",
+        params![root_path],
+    )?;
+    conn.execute("DELETE FROM project_exclusions", [])?;
+    Ok(())
+}
+
+/// Délie le dossier de projet et efface ses exclusions.
+pub fn project_clear(conn: &Connection) -> SqlResult<()> {
+    conn.execute("DELETE FROM project WHERE id = 1", [])?;
+    conn.execute("DELETE FROM project_exclusions", [])?;
+    Ok(())
+}
+
+/// Ajoute une exclusion (chemin relatif au projet, séparateurs `/`).
+pub fn project_add_exclusion(conn: &Connection, path: &str) -> SqlResult<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO project_exclusions (path) VALUES (?1)",
+        params![path],
+    )?;
+    Ok(())
+}
+
+/// Retire une exclusion.
+pub fn project_remove_exclusion(conn: &Connection, path: &str) -> SqlResult<()> {
+    conn.execute(
+        "DELETE FROM project_exclusions WHERE path = ?1",
+        params![path],
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn projet_persiste_en_base() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+
+        let empty = project_get(&conn).unwrap();
+        assert_eq!(empty.root_path, None);
+        assert!(empty.exclusions.is_empty());
+
+        project_set_root(&conn, "/tmp/projet").unwrap();
+        project_add_exclusion(&conn, "secret").unwrap();
+        let config = project_get(&conn).unwrap();
+        assert_eq!(config.root_path.as_deref(), Some("/tmp/projet"));
+        assert_eq!(config.exclusions, vec!["secret".to_string()]);
+
+        project_clear(&conn).unwrap();
+        let config = project_get(&conn).unwrap();
+        assert_eq!(config.root_path, None);
+        assert!(config.exclusions.is_empty());
+    }
 }

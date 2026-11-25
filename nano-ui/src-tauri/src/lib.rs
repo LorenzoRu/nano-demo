@@ -13,9 +13,12 @@ use tauri::State;
 use tauri::ipc::Channel;
 use tauri::LogicalPosition;
 use tauri::LogicalSize;
+use tauri_plugin_dialog::DialogExt;
 
 mod db;
-use db::{DbState, Conversation, ConversationListItem};
+mod permissions;
+use db::{DbState, Conversation, ConversationListItem, ProjectConfig};
+use permissions::{AccessKind, ProjectPolicy};
 
 /// État partagé entre les invocations : permet d'annuler un stream en cours
 /// depuis une autre commande (`cancel_chat`).
@@ -43,11 +46,6 @@ async fn chat(
         let mut guard = state.cancel.lock().map_err(|e| e.to_string())?;
         *guard = Some(cancel.clone());
     }
-
-    eprintln!(
-        "[nano] chat simple : modèle={model}, messages={}",
-        messages.len()
-    );
 
     // Applique la stratégie de contexte : prompt système + troncature des messages anciens
     let settings = ChatSettings {
@@ -99,7 +97,7 @@ fn cancel_chat(state: State<'_, AppState>) -> Result<(), String> {
 fn tool_read_file() -> ToolDefinition {
     ToolDefinition {
         name: "read_file".to_string(),
-        description: "Lit le contenu d'un fichier local et le retourne.".to_string(),
+        description: "Lit le contenu d'un fichier du projet et le retourne.".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -113,7 +111,7 @@ fn tool_read_file() -> ToolDefinition {
 fn tool_list_dir() -> ToolDefinition {
     ToolDefinition {
         name: "list_dir".to_string(),
-        description: "Liste le contenu d'un dossier local (fichiers et sous-dossiers).".to_string(),
+        description: "Liste le contenu d'un dossier du projet (fichiers et sous-dossiers).".to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -124,24 +122,52 @@ fn tool_list_dir() -> ToolDefinition {
     }
 }
 
-/// Exécute un outil demandé par le modèle.
-async fn execute_tool(tool_call: ToolCall) -> ToolResult {
-    // Accepte une chaîne simple (anciens modèles) ou les clés "path", "file_name" ou "dir".
-    let path = tool_call
-        .arguments
-        .as_str()
-        .map(str::to_string)
-        .or_else(|| {
-            ["path", "file_name", "dir", "directory"]
-                .iter()
-                .find_map(|key| {
-                    tool_call
-                        .arguments
-                        .get(*key)
-                        .and_then(|value| value.as_str())
-                        .map(str::to_string)
-                })
-        });
+fn tool_write_file() -> ToolDefinition {
+    ToolDefinition {
+        name: "write_file".to_string(),
+        description: "Écrit un fichier du projet avec le contenu fourni (création ou remplacement)."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string", "description": "Chemin du fichier à écrire" },
+                "content": { "type": "string", "description": "Contenu complet du fichier" }
+            },
+            "required": ["path", "content"]
+        }),
+    }
+}
+
+/// Extrait le chemin des arguments d'un outil.
+/// Accepte une chaîne simple (anciens modèles) ou les clés `path`, `file_name`, `dir`, `directory`.
+fn extract_path(arguments: &serde_json::Value) -> Option<String> {
+    arguments.as_str().map(str::to_string).or_else(|| {
+        ["path", "file_name", "dir", "directory"]
+            .iter()
+            .find_map(|key| {
+                arguments
+                    .get(*key)
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+    })
+}
+
+/// Extrait le contenu d'un fichier à écrire.
+fn extract_content(arguments: &serde_json::Value) -> Option<String> {
+    ["content", "text", "body"]
+        .iter()
+        .find_map(|key| {
+            arguments
+                .get(*key)
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
+}
+
+/// Exécute un outil demandé par le modèle, dans les limites du dossier de projet lié.
+async fn execute_tool(tool_call: ToolCall, project: &ProjectConfig) -> ToolResult {
+    let path = extract_path(&tool_call.arguments);
 
     let Some(path) = path.filter(|value| !value.trim().is_empty()) else {
         return ToolResult {
@@ -151,12 +177,96 @@ async fn execute_tool(tool_call: ToolCall) -> ToolResult {
         };
     };
 
+    let policy = match ProjectPolicy::new(project) {
+        Ok(policy) => policy,
+        Err(error) => {
+            return ToolResult {
+                name: tool_call.name,
+                content: error,
+                is_error: true,
+            };
+        }
+    };
+
+    let resolved = match tool_call.name.as_str() {
+        "read_file" | "list_dir" => policy.resolve(&path, AccessKind::Read),
+        "write_file" => policy.resolve(&path, AccessKind::Write),
+        _ => {
+            return ToolResult {
+                name: tool_call.name,
+                content: "Outil inconnu".to_string(),
+                is_error: true,
+            };
+        }
+    };
+
+    let resolved = match resolved {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            return ToolResult {
+                name: tool_call.name,
+                content: error,
+                is_error: true,
+            };
+        }
+    };
+
     match tool_call.name.as_str() {
-        "read_file" => {
-            match std::fs::read_to_string(&path) {
-                Ok(content) => ToolResult {
+        "read_file" => match std::fs::read_to_string(&resolved) {
+            Ok(content) => ToolResult {
+                name: tool_call.name,
+                content,
+                is_error: false,
+            },
+            Err(e) => ToolResult {
+                name: tool_call.name,
+                content: e.to_string(),
+                is_error: true,
+            },
+        },
+        "list_dir" => match std::fs::read_dir(&resolved) {
+            Ok(entries) => {
+                let mut items: Vec<String> = entries
+                    .filter_map(|entry| entry.ok())
+                    .filter(|entry| !policy.is_excluded(&entry.path()))
+                    .map(|entry| {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if entry.path().is_dir() {
+                            format!("{name}/")
+                        } else {
+                            name
+                        }
+                    })
+                    .collect();
+                items.sort();
+                ToolResult {
                     name: tool_call.name,
-                    content,
+                    content: items.join("\n"),
+                    is_error: false,
+                }
+            }
+            Err(e) => ToolResult {
+                name: tool_call.name,
+                content: e.to_string(),
+                is_error: true,
+            },
+        },
+        "write_file" => {
+            let Some(content) = extract_content(&tool_call.arguments) else {
+                return ToolResult {
+                    name: tool_call.name,
+                    content: "Argument « content » manquant.".to_string(),
+                    is_error: true,
+                };
+            };
+            match std::fs::write(&resolved, content.as_bytes()) {
+                Ok(()) => ToolResult {
+                    name: tool_call.name,
+                    content: format!(
+                        "Fichier écrit : {} ({} octets).",
+                        resolved.display(),
+                        content.len()
+                    ),
                     is_error: false,
                 },
                 Err(e) => ToolResult {
@@ -166,31 +276,7 @@ async fn execute_tool(tool_call: ToolCall) -> ToolResult {
                 },
             }
         }
-        "list_dir" => {
-            match std::fs::read_dir(&path) {
-                Ok(entries) => {
-                    let items: Vec<String> = entries
-                        .filter_map(|e| e.ok())
-                        .map(|e| e.file_name().to_string_lossy().to_string())
-                        .collect();
-                    ToolResult {
-                        name: tool_call.name,
-                        content: items.join("\n"),
-                        is_error: false,
-                    }
-                }
-                Err(e) => ToolResult {
-                    name: tool_call.name,
-                    content: e.to_string(),
-                    is_error: true,
-                },
-            }
-        }
-        _ => ToolResult {
-            name: tool_call.name,
-            content: "Outil inconnu".to_string(),
-            is_error: true,
-        },
+        _ => unreachable!("outil déjà filtré"),
     }
 }
 
@@ -199,6 +285,7 @@ async fn execute_tool(tool_call: ToolCall) -> ToolResult {
 #[tauri::command]
 async fn chat_agent(
     state: State<'_, AppState>,
+    db_state: State<'_, DbState>,
     model: String,
     messages: Vec<ChatMessage>,
     system_prompt: String,
@@ -212,33 +299,44 @@ async fn chat_agent(
         *guard = Some(cancel.clone());
     }
 
-    eprintln!(
-        "[nano][agent] modèle={model}, messages={}, outils=read_file,list_dir",
-        messages.len()
-    );
-    if let Ok(dir) = std::env::current_dir() {
-        eprintln!("[nano][agent] cwd={}", dir.display());
-    }
+    // Photographie des permissions au début du tour : une modification du projet
+    // pendant la génération ne change pas les droits en cours de route.
+    let project = {
+        let conn = db_state.conn.lock().map_err(|e| e.to_string())?;
+        db::project_get(&conn).map_err(|e| e.to_string())?
+    };
 
     // En mode agent, on ajoute toujours les instructions d'outils au prompt système :
     // si l'utilisateur a défini son propre prompt, un petit modèle peut sinon ignorer les outils.
-    const TOOL_INSTRUCTIONS: &str = "Tu disposes de deux outils : read_file (lire un fichier) et list_dir (lister un dossier).
-Règles :
-- Si l'utilisateur demande de lire un fichier, appelle read_file. Ne réponds jamais que tu ne peux pas accéder aux fichiers.
-- Si l'utilisateur demande de lister un dossier, appelle list_dir.
-- N'invente jamais le contenu d'un fichier : lis-le d'abord avec l'outil.
-- Pour appeler un outil, réponds uniquement avec un JSON de la forme {\"name\":\"read_file\",\"arguments\":{\"path\":\"/chemin/absolu\"}}.
-- Après le résultat d'un outil, réponds uniquement avec la synthèse demandée, de façon concise, sans répéter.
-- Réponds toujours en français.
-- Base-toi uniquement sur le contenu réellement renvoyé par l'outil ; n'invente aucun détail.
-
-Exemple :
-utilisateur : « Lis /tmp/a.txt »
-toi : {\"name\":\"read_file\",\"arguments\":{\"path\":\"/tmp/a.txt\"}}";
+    let project_hint = match project.root_path.as_deref() {
+        Some(root) => format!(
+            "Dossier de projet lié : {root}. Les chemins hors de ce dossier sont interdits, ainsi que les exclusions."
+        ),
+        None => "Aucun dossier de projet n'est lié. Les outils refuseront tout accès ; demande à l'utilisateur de lier un dossier dans le panneau Projet.".to_string(),
+    };
+    let tool_instructions = format!(
+        "Tu disposes de trois outils : read_file (lire un fichier), write_file (écrire un fichier) et list_dir (lister un dossier).\n\
+Règles :\n\
+- {project_hint}\n\
+- Si l'utilisateur demande de lire un fichier, appelle read_file.\n\
+- Reprends le chemin exactement tel que l'utilisateur l'a écrit, sans corriger ni réorthographier.\n\
+- Si le chemin est hors du dossier de projet, réponds directement que tu n'y as pas accès, sans appeler d'outil.\n\
+- Pour un chemin dans le projet, appelle l'outil même s'il pourrait être exclu : c'est l'outil qui décide.\n\
+- Si l'utilisateur demande d'écrire ou de modifier un fichier, appelle write_file avec le contenu complet.\n\
+- Si l'utilisateur demande de lister un dossier, appelle list_dir.\n\
+- N'invente jamais le contenu d'un fichier : lis-le d'abord avec l'outil.\n\
+- Pour appeler un outil, réponds uniquement avec un JSON de la forme {{\"name\":\"read_file\",\"arguments\":{{\"path\":\"/chemin/absolu\"}}}}.\n\
+- Après le résultat d'un outil, réponds uniquement avec la synthèse demandée, de façon concise, sans répéter.\n\
+- Réponds toujours en français.\n\
+- Base-toi uniquement sur le contenu réellement renvoyé par l'outil ; n'invente aucun détail.\n\n\
+Exemple :\n\
+utilisateur : « Lis /tmp/a.txt »\n\
+toi : {{\"name\":\"read_file\",\"arguments\":{{\"path\":\"/tmp/a.txt\"}}}}"
+    );
     let system_prompt = if system_prompt.is_empty() {
-        TOOL_INSTRUCTIONS.to_string()
+        tool_instructions
     } else {
-        format!("{system_prompt}\n\n{TOOL_INSTRUCTIONS}")
+        format!("{system_prompt}\n\n{tool_instructions}")
     };
 
     let settings = ChatSettings {
@@ -249,44 +347,15 @@ toi : {\"name\":\"read_file\",\"arguments\":{\"path\":\"/tmp/a.txt\"}}";
         .await
         .map_err(|e| e.to_string())?;
 
-    // Trace des derniers messages envoyés : permet de voir si un historique de refus
-    // influence le modèle, sans afficher le contenu.
-    for message in prepared_messages.iter().rev().take(3).rev() {
-        eprintln!(
-            "[nano][agent] contexte role={} longueur={}",
-            message.role,
-            message.content.len()
-        );
-    }
-
-    let tools = vec![tool_read_file(), tool_list_dir()];
+    let tools = vec![tool_read_file(), tool_write_file(), tool_list_dir()];
 
     let result = nano_core::run_agent_turn(
         &model,
         &prepared_messages,
         &tools,
         |tool_call| {
-            eprintln!(
-                "[nano][agent] outil demandé : {} {}",
-                tool_call.name, tool_call.arguments
-            );
-            Box::pin(async move {
-                let result = execute_tool(tool_call).await;
-                if result.is_error {
-                    let apercu: String = result.content.chars().take(200).collect();
-                    eprintln!(
-                        "[nano][agent] résultat {} (erreur) : {apercu:?}",
-                        result.name
-                    );
-                } else {
-                    eprintln!(
-                        "[nano][agent] résultat {} : {} octets",
-                        result.name,
-                        result.content.len()
-                    );
-                }
-                result
-            })
+            let project = project.clone();
+            Box::pin(async move { execute_tool(tool_call, &project).await })
         },
         |token| {
             let _ = on_token.send(token.to_string());
@@ -294,15 +363,6 @@ toi : {\"name\":\"read_file\",\"arguments\":{\"path\":\"/tmp/a.txt\"}}";
         &cancel,
     )
     .await;
-
-    match &result {
-        Ok(messages) => {
-            eprintln!("[nano][agent] terminé : {} messages", messages.len());
-        }
-        Err(error) => {
-            eprintln!("[nano][agent] erreur : {error:#}");
-        }
-    }
 
     // Détermine si l'annulation a été demandée avant de libérer l'état.
     let cancelled = {
@@ -338,6 +398,99 @@ fn save_settings(
 ) -> Result<(), String> {
     let conn = state.conn.lock().map_err(|e| e.to_string())?;
     db::conversation_settings_save(&conn, &id, &settings).map_err(|e| e.to_string())
+}
+
+// --- Commandes du projet lié ---
+
+#[tauri::command]
+fn project_get(state: State<'_, DbState>) -> Result<ProjectConfig, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    db::project_get(&conn).map_err(|e| e.to_string())
+}
+
+/// Ouvre le sélecteur de dossier natif et lie le dossier choisi.
+/// Si l'utilisateur annule, la configuration actuelle est renvoyée inchangée.
+#[tauri::command]
+async fn project_pick_folder(
+    app: tauri::AppHandle,
+    state: State<'_, DbState>,
+) -> Result<ProjectConfig, String> {
+    let folder = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog().file().blocking_pick_folder()
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+
+    if let Some(folder) = folder {
+        let path = folder.into_path().map_err(|e| e.to_string())?;
+        let path = std::fs::canonicalize(&path)
+            .map_err(|e| format!("Dossier inaccessible : {e}"))?;
+        if !path.is_dir() {
+            return Err("Le chemin choisi n'est pas un dossier.".to_string());
+        }
+        let conn = state.conn.lock().map_err(|e| e.to_string())?;
+        db::project_set_root(&conn, &path.to_string_lossy()).map_err(|e| e.to_string())?;
+    }
+
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    db::project_get(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn project_clear(state: State<'_, DbState>) -> Result<ProjectConfig, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    db::project_clear(&conn).map_err(|e| e.to_string())?;
+    db::project_get(&conn).map_err(|e| e.to_string())
+}
+
+/// Ajoute une exclusion (chemin relatif au projet ou absolu, fichier ou dossier).
+#[tauri::command]
+fn project_add_exclusion(
+    state: State<'_, DbState>,
+    path: String,
+) -> Result<ProjectConfig, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    let project = db::project_get(&conn).map_err(|e| e.to_string())?;
+    let root_str = project
+        .root_path
+        .as_deref()
+        .ok_or_else(|| "Aucun dossier de projet lié.".to_string())?;
+    let root = std::fs::canonicalize(root_str)
+        .map_err(|e| format!("Dossier de projet inaccessible : {e}"))?;
+
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("Chemin d'exclusion vide.".to_string());
+    }
+    let candidate = std::path::Path::new(path);
+    let joined = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        root.join(candidate)
+    };
+    let canonical = std::fs::canonicalize(&joined)
+        .map_err(|_| format!("Chemin introuvable dans le projet : {path}"))?;
+
+    if canonical == root {
+        return Err("Le dossier de projet lui-même ne peut pas être exclu.".to_string());
+    }
+    let relative = canonical
+        .strip_prefix(&root)
+        .map_err(|_| format!("Ce chemin est hors du dossier de projet : {path}"))?;
+    let relative = relative.to_string_lossy().replace('\\', "/");
+
+    db::project_add_exclusion(&conn, &relative).map_err(|e| e.to_string())?;
+    db::project_get(&conn).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn project_remove_exclusion(
+    state: State<'_, DbState>,
+    path: String,
+) -> Result<ProjectConfig, String> {
+    let conn = state.conn.lock().map_err(|e| e.to_string())?;
+    db::project_remove_exclusion(&conn, &path).map_err(|e| e.to_string())?;
+    db::project_get(&conn).map_err(|e| e.to_string())
 }
 
 // --- Commandes de gestion des conversations ---
@@ -464,6 +617,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let data_dir = dirs::data_dir().unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             let db_dir = data_dir.join("nano");
@@ -520,6 +674,11 @@ pub fn run() {
             chat_agent,
             get_settings,
             save_settings,
+            project_get,
+            project_pick_folder,
+            project_clear,
+            project_add_exclusion,
+            project_remove_exclusion,
             toggle_fullscreen,
             conversation_new,
             conversation_list,
