@@ -249,9 +249,24 @@ pub async fn run_agent_turn(
         }
 
         // Exécute chaque outil et réinjecte le résultat
+        let mut results = Vec::new();
         for tool_call in &response.tool_calls {
             let result = execute_tool(tool_call.clone()).await;
             all_messages.push(crate::tools::tool_result_to_message(&tool_call.name, &result));
+            results.push(result);
+        }
+
+        // Un refus de sécurité est une réponse finale en soi : on ne laisse pas le
+        // modèle inventer une réussite à partir du message d'erreur.
+        if let Some(message) = crate::tools::fatal_error_message(&results) {
+            for token in message.split_inclusive(' ') {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(anyhow::anyhow!("stream cancelled"));
+                }
+                on_token(token);
+            }
+            all_messages.push(crate::tools::AgentMessage::assistant(message, Vec::new()));
+            return Ok(all_messages);
         }
     }
 

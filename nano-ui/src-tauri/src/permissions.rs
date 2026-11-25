@@ -1,3 +1,4 @@
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::db::ProjectConfig;
@@ -7,6 +8,33 @@ use crate::db::ProjectConfig;
 pub enum AccessKind {
     Read,
     Write,
+}
+
+/// Erreur d'accès à un chemin du projet.
+/// Les variantes `NoProject`, `OutsideRoot` et `Excluded` sont des refus de
+/// sécurité : l'adaptateur les marque comme fatales pour la boucle agent.
+#[derive(Debug)]
+pub enum AccessError {
+    NoProject,
+    OutsideRoot(String),
+    Excluded(String),
+    Invalid(String),
+}
+
+impl fmt::Display for AccessError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoProject => write!(
+                f,
+                "Aucun dossier de projet lié. Ouvre le panneau Projet pour en choisir un."
+            ),
+            Self::OutsideRoot(path) => {
+                write!(f, "Accès refusé : {path} est hors du dossier de projet.")
+            }
+            Self::Excluded(path) => write!(f, "Accès refusé : {path} est exclu du projet."),
+            Self::Invalid(reason) => write!(f, "{reason}"),
+        }
+    }
 }
 
 /// Politique de permissions du dossier de projet.
@@ -20,12 +48,14 @@ pub struct ProjectPolicy {
 }
 
 impl ProjectPolicy {
-    pub fn new(project: &ProjectConfig) -> Result<Self, String> {
-        let root = project.root_path.as_deref().ok_or_else(|| {
-            "Aucun dossier de projet lié. Ouvre le panneau Projet pour en choisir un.".to_string()
+    pub fn new(project: &ProjectConfig) -> Result<Self, AccessError> {
+        let root = project
+            .root_path
+            .as_deref()
+            .ok_or(AccessError::NoProject)?;
+        let root = std::fs::canonicalize(root).map_err(|e| {
+            AccessError::Invalid(format!("Dossier de projet inaccessible ({root}) : {e}"))
         })?;
-        let root = std::fs::canonicalize(root)
-            .map_err(|e| format!("Dossier de projet inaccessible ({root}) : {e}"))?;
 
         let exclusions = project
             .exclusions
@@ -38,10 +68,10 @@ impl ProjectPolicy {
 
     /// Résout un chemin demandé par le modèle et vérifie qu'il reste dans le projet.
     /// Pour une écriture, le fichier peut ne pas encore exister : on canonicalise alors son parent.
-    pub fn resolve(&self, requested: &str, kind: AccessKind) -> Result<PathBuf, String> {
+    pub fn resolve(&self, requested: &str, kind: AccessKind) -> Result<PathBuf, AccessError> {
         let requested = requested.trim();
         if requested.is_empty() {
-            return Err("Chemin vide.".to_string());
+            return Err(AccessError::Invalid("Chemin vide.".to_string()));
         }
 
         let joined = if Path::new(requested).is_absolute() {
@@ -53,28 +83,28 @@ impl ProjectPolicy {
         let resolved = match std::fs::canonicalize(&joined) {
             Ok(path) => path,
             Err(_) if kind == AccessKind::Write => {
-                let file_name = joined
-                    .file_name()
-                    .ok_or_else(|| format!("Chemin invalide : {requested}"))?;
-                let parent = joined
-                    .parent()
-                    .ok_or_else(|| format!("Chemin invalide : {requested}"))?;
+                let file_name = joined.file_name().ok_or_else(|| {
+                    AccessError::Invalid(format!("Chemin invalide : {requested}"))
+                })?;
+                let parent = joined.parent().ok_or_else(|| {
+                    AccessError::Invalid(format!("Chemin invalide : {requested}"))
+                })?;
                 let parent = std::fs::canonicalize(parent).map_err(|_| {
-                    format!("Dossier parent introuvable pour {requested}.")
+                    AccessError::Invalid(format!("Dossier parent introuvable pour {requested}."))
                 })?;
                 parent.join(file_name)
             }
-            Err(_) => return Err(format!("Chemin introuvable : {requested}.")),
+            Err(_) => {
+                return Err(AccessError::Invalid(format!("Chemin introuvable : {requested}.")));
+            }
         };
 
         if !resolved.starts_with(&self.root) {
-            return Err(format!(
-                "Accès refusé : {requested} est hors du dossier de projet."
-            ));
+            return Err(AccessError::OutsideRoot(requested.to_string()));
         }
 
         if self.is_excluded(&resolved) {
-            return Err(format!("Accès refusé : {requested} est exclu du projet."));
+            return Err(AccessError::Excluded(requested.to_string()));
         }
 
         Ok(resolved)
@@ -129,7 +159,7 @@ mod tests {
     #[test]
     fn refuse_without_project() {
         let error = ProjectPolicy::new(&ProjectConfig::default()).unwrap_err();
-        assert!(error.contains("Aucun dossier de projet"));
+        assert!(error.to_string().contains("Aucun dossier de projet"));
     }
 
     #[test]
@@ -156,14 +186,14 @@ mod tests {
         let error = policy
             .resolve(file.to_string_lossy().as_ref(), AccessKind::Read)
             .unwrap_err();
-        assert!(error.contains("hors du dossier de projet"));
+        assert!(error.to_string().contains("hors du dossier de projet"));
 
         // Tentative de sortie par `..` vers le dossier frère réellement créé.
         let outside_name = outside.file_name().unwrap().to_string_lossy();
         let error = policy
             .resolve(&format!("../{outside_name}"), AccessKind::Read)
             .unwrap_err();
-        assert!(error.contains("hors du dossier de projet"));
+        assert!(error.to_string().contains("hors du dossier de projet"));
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&outside).ok();
@@ -179,7 +209,7 @@ mod tests {
         let policy = ProjectPolicy::new(&config(&root, &["prive"])).unwrap();
         assert!(policy.resolve("public.txt", AccessKind::Read).is_ok());
         let error = policy.resolve("prive/secret.txt", AccessKind::Read).unwrap_err();
-        assert!(error.contains("exclu du projet"));
+        assert!(error.to_string().contains("exclu du projet"));
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -209,7 +239,7 @@ mod tests {
 
         let policy = ProjectPolicy::new(&config(&root, &[])).unwrap();
         let error = policy.resolve("lien/secret.txt", AccessKind::Read).unwrap_err();
-        assert!(error.contains("hors du dossier de projet"));
+        assert!(error.to_string().contains("hors du dossier de projet"));
 
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_dir_all(&outside).ok();

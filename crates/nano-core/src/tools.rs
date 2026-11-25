@@ -15,6 +15,23 @@ pub struct ToolResult {
     pub name: String,
     pub content: String,
     pub is_error: bool,
+    /// Refus de sécurité : la boucle agent ne doit pas laisser le modèle conclure.
+    pub fatal: bool,
+}
+
+impl ToolResult {
+    pub fn ok(name: String, content: String) -> Self {
+        Self { name, content, is_error: false, fatal: false }
+    }
+
+    pub fn error(name: String, content: impl Into<String>) -> Self {
+        Self { name, content: content.into(), is_error: true, fatal: false }
+    }
+
+    /// Erreur de permissions : réponse déterministe, sans génération du modèle.
+    pub fn denied(name: String, content: impl Into<String>) -> Self {
+        Self { name, content: content.into(), is_error: true, fatal: true }
+    }
 }
 
 /// Déclaration d'un outil disponible pour le modèle.
@@ -216,6 +233,15 @@ pub fn extract_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
     None
 }
 
+/// Message déterministe à afficher quand un outil a refusé l'accès.
+/// Le modèle ne doit pas être rappelé pour commenter un refus de sécurité.
+pub fn fatal_error_message(results: &[ToolResult]) -> Option<String> {
+    results
+        .iter()
+        .find(|result| result.fatal)
+        .map(|result| format!("{} : {}", result.name, result.content))
+}
+
 /// Convertit un ToolResult en message à réinjecter dans la conversation.
 pub fn tool_result_to_message(tool_name: &str, result: &ToolResult) -> AgentMessage {
     let content = if result.is_error {
@@ -306,6 +332,7 @@ mod tests {
                 name: "list_dir".to_string(),
                 content: "a.txt\nb.txt".to_string(),
                 is_error: false,
+                fatal: false,
             }),
         ];
 
@@ -316,5 +343,23 @@ mod tests {
         assert_eq!(value[1]["role"], "tool");
         assert_eq!(value[1]["tool_name"], "list_dir");
         assert_eq!(value[1]["content"], "a.txt\nb.txt");
+    }
+
+    #[test]
+    fn fatal_error_message_is_deterministic() {
+        let results = vec![
+            ToolResult::ok("read_file".to_string(), "contenu".to_string()),
+            ToolResult::error("list_dir".to_string(), "chemin introuvable"),
+            ToolResult::denied(
+                "write_file".to_string(),
+                "Accès refusé : hors du dossier de projet.",
+            ),
+        ];
+
+        assert_eq!(
+            fatal_error_message(&results).as_deref(),
+            Some("write_file : Accès refusé : hors du dossier de projet.")
+        );
+        assert!(fatal_error_message(&results[..2]).is_none());
     }
 }

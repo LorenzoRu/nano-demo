@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use nano_core::{ChatMessage, context::build_context, settings::ChatSettings, tools::{ToolCall, ToolResult, ToolDefinition}};
 use serde::{Deserialize, Serialize};
+use tauri::Emitter;
 use tauri::Listener;
 use tauri::Manager;
 use tauri::Position;
@@ -18,12 +19,52 @@ use tauri_plugin_dialog::DialogExt;
 mod db;
 mod permissions;
 use db::{DbState, Conversation, ConversationListItem, ProjectConfig};
-use permissions::{AccessKind, ProjectPolicy};
+use permissions::{AccessError, AccessKind, ProjectPolicy};
 
 /// État partagé entre les invocations : permet d'annuler un stream en cours
 /// depuis une autre commande (`cancel_chat`).
 struct AppState {
     cancel: Mutex<Option<Arc<AtomicBool>>>,
+}
+
+/// Trace d'un outil envoyée à l'interface pendant une réponse agent.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolTraceEvent {
+    tool: String,
+    arguments: String,
+    result: String,
+    is_error: bool,
+    fatal: bool,
+}
+
+const TOOL_TRACE_EVENT: &str = "agent-tool-trace";
+
+impl AccessError {
+    /// Les refus de permissions sont fatals ; les erreurs de chemin restent
+    /// récupérables par le modèle (il peut corriger une faute de frappe).
+    fn to_tool_result(self, name: String) -> ToolResult {
+        let fatal = matches!(
+            self,
+            Self::NoProject | Self::OutsideRoot(_) | Self::Excluded(_)
+        );
+        let content = self.to_string();
+        if fatal {
+            ToolResult::denied(name, content)
+        } else {
+            ToolResult::error(name, content)
+        }
+    }
+}
+
+/// Aperçu borné pour éviter d'envoyer des fichiers entiers dans l'UI.
+fn trace_preview(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_string();
+    }
+    let mut preview: String = value.chars().take(max).collect();
+    preview.push('…');
+    preview
 }
 
 #[tauri::command]
@@ -167,62 +208,33 @@ fn extract_content(arguments: &serde_json::Value) -> Option<String> {
 
 /// Exécute un outil demandé par le modèle, dans les limites du dossier de projet lié.
 async fn execute_tool(tool_call: ToolCall, project: &ProjectConfig) -> ToolResult {
+    let name = tool_call.name.clone();
     let path = extract_path(&tool_call.arguments);
 
     let Some(path) = path.filter(|value| !value.trim().is_empty()) else {
-        return ToolResult {
-            name: tool_call.name,
-            content: "Argument « path » manquant ou vide.".to_string(),
-            is_error: true,
-        };
+        return ToolResult::error(name, "Argument « path » manquant ou vide.");
     };
 
     let policy = match ProjectPolicy::new(project) {
         Ok(policy) => policy,
-        Err(error) => {
-            return ToolResult {
-                name: tool_call.name,
-                content: error,
-                is_error: true,
-            };
-        }
+        Err(error) => return error.to_tool_result(name),
     };
 
-    let resolved = match tool_call.name.as_str() {
+    let resolved = match name.as_str() {
         "read_file" | "list_dir" => policy.resolve(&path, AccessKind::Read),
         "write_file" => policy.resolve(&path, AccessKind::Write),
-        _ => {
-            return ToolResult {
-                name: tool_call.name,
-                content: "Outil inconnu".to_string(),
-                is_error: true,
-            };
-        }
+        _ => return ToolResult::error(name, "Outil inconnu"),
     };
 
     let resolved = match resolved {
         Ok(resolved) => resolved,
-        Err(error) => {
-            return ToolResult {
-                name: tool_call.name,
-                content: error,
-                is_error: true,
-            };
-        }
+        Err(error) => return error.to_tool_result(name),
     };
 
-    match tool_call.name.as_str() {
+    match name.as_str() {
         "read_file" => match std::fs::read_to_string(&resolved) {
-            Ok(content) => ToolResult {
-                name: tool_call.name,
-                content,
-                is_error: false,
-            },
-            Err(e) => ToolResult {
-                name: tool_call.name,
-                content: e.to_string(),
-                is_error: true,
-            },
+            Ok(content) => ToolResult::ok(name, content),
+            Err(e) => ToolResult::error(name, e.to_string()),
         },
         "list_dir" => match std::fs::read_dir(&resolved) {
             Ok(entries) => {
@@ -230,50 +242,33 @@ async fn execute_tool(tool_call: ToolCall, project: &ProjectConfig) -> ToolResul
                     .filter_map(|entry| entry.ok())
                     .filter(|entry| !policy.is_excluded(&entry.path()))
                     .map(|entry| {
-                        let name = entry.file_name().to_string_lossy().to_string();
+                        let entry_name = entry.file_name().to_string_lossy().to_string();
                         if entry.path().is_dir() {
-                            format!("{name}/")
+                            format!("{entry_name}/")
                         } else {
-                            name
+                            entry_name
                         }
                     })
                     .collect();
                 items.sort();
-                ToolResult {
-                    name: tool_call.name,
-                    content: items.join("\n"),
-                    is_error: false,
-                }
+                ToolResult::ok(name, items.join("\n"))
             }
-            Err(e) => ToolResult {
-                name: tool_call.name,
-                content: e.to_string(),
-                is_error: true,
-            },
+            Err(e) => ToolResult::error(name, e.to_string()),
         },
         "write_file" => {
             let Some(content) = extract_content(&tool_call.arguments) else {
-                return ToolResult {
-                    name: tool_call.name,
-                    content: "Argument « content » manquant.".to_string(),
-                    is_error: true,
-                };
+                return ToolResult::error(name, "Argument « content » manquant.");
             };
             match std::fs::write(&resolved, content.as_bytes()) {
-                Ok(()) => ToolResult {
-                    name: tool_call.name,
-                    content: format!(
+                Ok(()) => ToolResult::ok(
+                    name,
+                    format!(
                         "Fichier écrit : {} ({} octets).",
                         resolved.display(),
                         content.len()
                     ),
-                    is_error: false,
-                },
-                Err(e) => ToolResult {
-                    name: tool_call.name,
-                    content: e.to_string(),
-                    is_error: true,
-                },
+                ),
+                Err(e) => ToolResult::error(name, e.to_string()),
             }
         }
         _ => unreachable!("outil déjà filtré"),
@@ -284,6 +279,7 @@ async fn execute_tool(tool_call: ToolCall, project: &ProjectConfig) -> ToolResul
 
 #[tauri::command]
 async fn chat_agent(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     db_state: State<'_, DbState>,
     model: String,
@@ -355,7 +351,23 @@ toi : {{\"name\":\"read_file\",\"arguments\":{{\"path\":\"/tmp/a.txt\"}}}}"
         &tools,
         |tool_call| {
             let project = project.clone();
-            Box::pin(async move { execute_tool(tool_call, &project).await })
+            let app = app.clone();
+            Box::pin(async move {
+                let arguments = serde_json::to_string_pretty(&tool_call.arguments)
+                    .unwrap_or_else(|_| tool_call.arguments.to_string());
+                let result = execute_tool(tool_call, &project).await;
+                let _ = app.emit(
+                    TOOL_TRACE_EVENT,
+                    ToolTraceEvent {
+                        tool: result.name.clone(),
+                        arguments: trace_preview(&arguments, 600),
+                        result: trace_preview(&result.content, 1200),
+                        is_error: result.is_error,
+                        fatal: result.fatal,
+                    },
+                );
+                result
+            })
         },
         |token| {
             let _ = on_token.send(token.to_string());

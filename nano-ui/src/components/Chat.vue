@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { ref, onMounted, nextTick, watch } from "vue";
+import { ref, onMounted, onUnmounted, nextTick, watch } from "vue";
 import { invoke, Channel } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { marked } from "marked";
 import hljs from "highlight.js";
 import DOMPurify from "dompurify";
@@ -35,6 +36,13 @@ interface ProjectConfig {
   root_path: string | null;
   exclusions: string[];
 }
+interface ToolTrace {
+  tool: string;
+  arguments: string;
+  result: string;
+  isError: boolean;
+  fatal: boolean;
+}
 
 /* ---------- État ---------- */
 const models = ref<string[]>([]);
@@ -48,6 +56,11 @@ const list = ref<HTMLElement | null>(null);
 const stoppedByUserIdx = ref<number | null>(null);
 const currentAssistantIdx = ref<number | null>(null);
 const awaitingFirstToken = ref(false);
+
+/* Traces des outils agent, indexées par message (non persistées) */
+const toolTraces = ref<Record<number, ToolTrace[]>>({});
+const activeTraceIdx = ref<number | null>(null);
+let unlistenToolTraces: (() => void) | null = null;
 
 /* Multi-conversation */
 const conversations = ref<ConversationListItem[]>([]);
@@ -193,6 +206,7 @@ async function loadConversationMessages(id: string) {
     currentConversationId.value = id;
     currentConversationTitle.value = conv.title;
     messages.value = conv.messages;
+    toolTraces.value = {};
     model.value = models.value[0] ?? "";
     // Charge les paramètres de la conversation (prompt système + contexte)
     const settings = await invoke<{ system_prompt: string; context_limit: number }>("get_settings", { id });
@@ -211,6 +225,7 @@ async function confirmPassword() {
     const conv = await invoke<Conversation>("conversation_get", { id, password: passwordInput.value });
     currentConversationId.value = id;
     messages.value = conv.messages;
+    toolTraces.value = {};
     model.value = models.value[0] ?? "";
     isPasswordModalOpen.value = false;
     pendingConversationId.value = null;
@@ -372,6 +387,7 @@ async function deleteConversation(id: string) {
     if (currentConversationId.value === id) {
       currentConversationId.value = null;
       messages.value = [];
+      toolTraces.value = {};
       if (conversations.value.length > 0) {
         await openConversation(conversations.value[0].id);
       }
@@ -418,6 +434,15 @@ function cancelRename() {
 
 /* ---------- Initialisation ---------- */
 onMounted(async () => {
+  unlistenToolTraces = await listen<ToolTrace>("agent-tool-trace", (event) => {
+    const idx = activeTraceIdx.value;
+    if (idx === null) return;
+    const traces = (toolTraces.value[idx] ??= []);
+    traces.push(event.payload);
+    nextTick(() => {
+      list.value?.scrollTo({ top: list.value.scrollHeight });
+    });
+  });
   try {
     const status = await invoke<OllamaStatus>("get_ollama_status");
     models.value = status.models.map((m) => m.name);
@@ -427,6 +452,10 @@ onMounted(async () => {
   }
   await loadProject();
   await loadConversations();
+});
+
+onUnmounted(() => {
+  unlistenToolTraces?.();
 });
 
 /* ---------- Envoi / arrêt ---------- */
@@ -450,6 +479,8 @@ async function send() {
   const history = [...messages.value];
   const idx = messages.value.push({ role: "assistant", content: "" }) - 1;
   currentAssistantIdx.value = idx;
+  activeTraceIdx.value = idx;
+  toolTraces.value[idx] = [];
 
   const onToken = new Channel<string>();
   onToken.onmessage = (token) => {
@@ -495,6 +526,7 @@ async function send() {
     stopping.value = false;
     awaitingFirstToken.value = false;
     currentAssistantIdx.value = null;
+    activeTraceIdx.value = null;
     // Sauvegarde automatique dans SQLite après réception complète
     await queueSave();
   }
@@ -711,6 +743,27 @@ async function stop() {
           >
             <div v-if="m.role === 'assistant'" class="markdown-content" v-html="renderMarkdown(m.content)"></div>
             <div v-else>{{ m.content }}</div>
+            <div v-if="m.role === 'assistant' && toolTraces[i]?.length" class="tool-traces">
+              <details v-for="(trace, t) in toolTraces[i]" :key="t">
+                <summary>
+                  <span class="trace-icon" :class="{ failure: trace.isError || trace.fatal }">
+                    {{ trace.isError || trace.fatal ? "✗" : "✓" }}
+                  </span>
+                  <span>{{ trace.tool }}</span>
+                  <span v-if="trace.fatal" class="trace-tag">refus</span>
+                </summary>
+                <div class="trace-detail">
+                  <div v-if="trace.arguments" class="trace-block">
+                    <span class="trace-label">Arguments</span>
+                    <pre>{{ trace.arguments }}</pre>
+                  </div>
+                  <div v-if="trace.result" class="trace-block">
+                    <span class="trace-label">Résultat</span>
+                    <pre>{{ trace.result }}</pre>
+                  </div>
+                </div>
+              </details>
+            </div>
             <span
               v-if="m.role === 'assistant' && i === currentAssistantIdx && busy && awaitingFirstToken"
               class="typing-indicator"
@@ -946,6 +999,18 @@ header {
 .msg.user { white-space: pre-wrap; align-self: flex-end; background: var(--color-user-msg); }
 .msg.assistant { align-self: flex-start; background: var(--color-assistant-msg); }
 .stopped-hint { display: block; font-size: 0.7rem; color: var(--color-hint); margin-top: 0.25rem; }
+
+/* Traces des outils agent (texte brut, jamais de v-html) */
+.tool-traces { margin-top: 0.5rem; display: flex; flex-direction: column; gap: 0.25rem; }
+.tool-traces details { border: 1px solid var(--color-border); border-radius: 4px; background: var(--color-bg); font-size: 0.75rem; }
+.tool-traces summary { cursor: pointer; padding: 0.25rem 0.5rem; display: flex; gap: 0.4rem; align-items: center; color: var(--color-text-muted); }
+.trace-icon { color: #3fb950; font-weight: 700; }
+.trace-icon.failure { color: var(--color-error); }
+.trace-tag { border: 1px solid var(--color-error); border-radius: 3px; padding: 0 0.25rem; color: var(--color-error); }
+.trace-detail { padding: 0 0.5rem 0.5rem; border-top: 1px solid var(--color-border); max-height: 16rem; overflow-y: auto; }
+.trace-block { margin-top: 0.4rem; }
+.trace-label { display: block; color: var(--color-text-muted); font-weight: 600; }
+.trace-detail pre { margin: 0.2rem 0 0; white-space: pre-wrap; overflow-wrap: anywhere; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace; color: var(--color-text); }
 .typing-indicator { display: flex; gap: 4px; align-items: center; margin: 0.5rem 0 0; font-size: 0.9rem; color: var(--color-text-muted); align-self: flex-start; }
 .typing-indicator span { width: 8px; height: 8px; border-radius: 50%; background: var(--color-typing-dot); animation: typing 1.4s infinite ease-in-out both; }
 .typing-indicator span:nth-child(1) { animation-delay: 0s; }
